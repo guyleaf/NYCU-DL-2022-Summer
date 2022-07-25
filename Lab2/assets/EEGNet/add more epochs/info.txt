@@ -1,0 +1,6 @@
+epoch size = 5000
+learning rate = 1e-3
+weight decay = 5e-1
+original model
+
+To sum up: cannot solve the overfitting problem directly. If the weight decay is high, the test loss is also rising up.

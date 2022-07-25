@@ -1,0 +1,6 @@
+epoch size = 2000
+learning rate = 1e-3
+weight decay = 3e-1
+original model
+
+in order to compare with no overfitting
