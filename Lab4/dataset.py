@@ -2,7 +2,7 @@ import torch
 import os
 import numpy as np
 import csv
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from torchvision import transforms
 from PIL import Image
 
@@ -13,7 +13,7 @@ default_transform = transforms.Compose(
 )
 
 
-class bair_robot_pushing_dataset(Dataset):
+class BairRobotPushingDataset(Dataset):
     def __init__(self, args, mode="train", transform=default_transform):
         assert mode == "train" or mode == "test" or mode == "validate"
         self.root = "{}/{}".format(args.data_root, mode)

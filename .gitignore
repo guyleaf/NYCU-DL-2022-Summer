@@ -203,4 +203,4 @@ cython_debug/
 
 *.zip
 data/
-models/
+/Lab*/models

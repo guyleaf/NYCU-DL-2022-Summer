@@ -8,13 +8,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.autograd import Variable
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset import BairRobotPushingDataset
-from models.lstm import gaussian_lstm, lstm
-from models.vgg_64 import vgg_decoder, vgg_encoder
 from utils import init_weights, kl_criterion, plot_pred, finn_eval_seq, pred
 
 torch.backends.cudnn.benchmark = True

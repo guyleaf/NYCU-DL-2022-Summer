@@ -14,6 +14,7 @@ from torchvision.utils import save_image
 
 
 def kl_criterion(mu, logvar, args):
+    # derivation: https://stats.stackexchange.com/a/7443
     # 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
     KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
     KLD /= args.batch_size
