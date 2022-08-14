@@ -1,18 +1,23 @@
 import argparse
-import itertools
 import os
 import random
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from models import CVAE
 from dataset import BairRobotPushingDataset
-from utils import init_weights, kl_criterion, plot_pred, finn_eval_seq, pred
+from schedulers import KLAnnealingScheduler
+from utils import (
+    init_weights,
+    kl_criterion,
+    plot_pred,
+    finn_eval_seq,
+    evaluate,
+)
 
 torch.backends.cudnn.benchmark = True
 
@@ -23,16 +28,13 @@ def parse_args():
         "--lr", default=0.002, type=float, help="learning rate"
     )
     parser.add_argument(
-        "--beta1", default=0.9, type=float, help="momentum term for adam"
-    )
-    parser.add_argument(
         "--batch_size", default=12, type=int, help="batch size"
     )
     parser.add_argument(
         "--log_dir", default="./logs/fp", help="base directory to save logs"
     )
     parser.add_argument(
-        "--model_dir", default="", help="base directory to save logs"
+        "--model_dir", default="", help="base directory to save models"
     )
     parser.add_argument(
         "--data_root",
@@ -43,7 +45,10 @@ def parse_args():
         "--optimizer", default="adam", help="optimizer to train with"
     )
     parser.add_argument(
-        "--niter", type=int, default=300, help="number of epochs to train for"
+        "--momentum",
+        default=0.9,
+        type=float,
+        help="momentum term for optimizer",
     )
     parser.add_argument(
         "--epoch_size", type=int, default=600, help="epoch size"
@@ -116,6 +121,9 @@ def parse_args():
         "--predictor_rnn_layers", type=int, default=2, help="number of layers"
     )
     parser.add_argument(
+        "--c_dim", type=int, default=32, help="dimensionality of c_t"
+    )
+    parser.add_argument(
         "--z_dim", type=int, default=64, help="dimensionality of z_t"
     )
     parser.add_argument(
@@ -123,9 +131,6 @@ def parse_args():
         type=int,
         default=128,
         help="dimensionality of encoder output vector and decoder input vector",
-    )
-    parser.add_argument(
-        "--beta", type=float, default=0.0001, help="weighting on KL to prior"
     )
     parser.add_argument(
         "--num_workers",
@@ -138,60 +143,53 @@ def parse_args():
         action="store_true",
         help="if true, skip connections go between frame t and frame t+t rather than last ground truth frame",
     )
-    parser.add_argument("--cuda", default=False, action="store_true")
 
     args = parser.parse_args()
     return args
 
 
-def train(x, condition, modules, optimizer, kl_anneal, args):
-    modules["frame_predictor"].zero_grad()
-    modules["posterior"].zero_grad()
-    modules["encoder"].zero_grad()
-    modules["decoder"].zero_grad()
-
-    # initialize the hidden state.
-    modules["frame_predictor"].hidden = modules[
-        "frame_predictor"
-    ].init_hidden()
-    modules["posterior"].hidden = modules["posterior"].init_hidden()
+def train(
+    model: CVAE,
+    sequences: torch.Tensor,
+    conditions: torch.Tensor,
+    optimizer: torch.optim.Optimizer,
+    scheduler: KLAnnealingScheduler,
+    teacher_forcing_ratio: float,
+):
     mse = 0
     kld = 0
-    use_teacher_forcing = True if random.random() < args.tfr else False
-    for i in range(1, args.n_past + args.n_future):
+    use_teacher_forcing = (
+        True if random.random() < teacher_forcing_ratio else False
+    )
+
+    model.init_hiddens()
+    for i, x in enumerate(sequences):
+        c = conditions[i]
         raise NotImplementedError
 
-    beta = kl_anneal.get_beta()
+    beta = scheduler.get_beta()
     loss = mse + kld * beta
     loss.backward()
 
     optimizer.step()
+    scheduler.step()
+    optimizer.zero_grad()
 
+    length_of_sequence = x.size(0)
     return (
-        loss.detach().cpu().numpy() / (args.n_past + args.n_future),
-        mse.detach().cpu().numpy() / (args.n_past + args.n_future),
-        kld.detach().cpu().numpy() / (args.n_future + args.n_past),
+        loss.detach().cpu().numpy() / length_of_sequence,
+        mse.detach().cpu().numpy() / length_of_sequence,
+        kld.detach().cpu().numpy() / length_of_sequence,
     )
-
-
-class kl_annealing:
-    def __init__(self, args):
-        super().__init__()
-        raise NotImplementedError
-
-    def update(self):
-        raise NotImplementedError
-
-    def get_beta(self):
-        raise NotImplementedError
 
 
 def main():
     args = parse_args()
-    if args.cuda:
-        assert torch.cuda.is_available(), "CUDA is not available."
+    if torch.cuda.is_available():
+        print("Use gpu to train the model.")
         device = "cuda"
     else:
+        print("Use cpu to train the model.")
         device = "cpu"
 
     assert args.n_past + args.n_future <= 30 and args.n_eval <= 30
@@ -202,34 +200,34 @@ def main():
     if args.model_dir != "":
         # load model and continue training from checkpoint
         saved_model = torch.load("%s/model.pth" % args.model_dir)
-        optimizer = args.optimizer
         model_dir = args.model_dir
-        niter = args.niter
+        epoch_size = args.epoch_size
         args = saved_model["args"]
-        args.optimizer = optimizer
         args.model_dir = model_dir
         args.log_dir = "%s/continued" % args.log_dir
-        start_epoch = saved_model["last_epoch"]
+        last_epoch = saved_model["last_epoch"]
     else:
         name = (
-            "rnn_size=%d-predictor-posterior-rnn_layers=%d-%d-n_past=%d-n_future=%d-lr=%.4f-g_dim=%d-z_dim=%d-last_frame_skip=%s-beta=%.7f"
+            "rnn_size=%d-predictor-posterior-rnn_layers=%d-%d-n_past=%d-n_future=%d-optimizer=%s-lr=%.4f-momentum=%.4f-c_dim=%d-g_dim=%d-z_dim=%d-last_frame_skip=%s"
             % (
                 args.rnn_size,
                 args.predictor_rnn_layers,
                 args.posterior_rnn_layers,
                 args.n_past,
                 args.n_future,
+                args.optimizer,
                 args.lr,
+                args.momentum,
+                args.c_dim,
                 args.g_dim,
                 args.z_dim,
                 args.last_frame_skip,
-                args.beta,
             )
         )
 
         args.log_dir = "%s/%s" % (args.log_dir, name)
-        niter = args.niter
-        start_epoch = 0
+        epoch_size = args.epoch_size
+        last_epoch = 0
 
     os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs("%s/gen/" % args.log_dir, exist_ok=True)
@@ -249,46 +247,6 @@ def main():
     ) as train_record:
         train_record.write("args: {}\n".format(args))
 
-    # ------------ build the models  --------------
-
-    if args.model_dir != "":
-        frame_predictor = saved_model["frame_predictor"]
-        posterior = saved_model["posterior"]
-    else:
-        frame_predictor = lstm(
-            args.g_dim + args.z_dim,
-            args.g_dim,
-            args.rnn_size,
-            args.predictor_rnn_layers,
-            args.batch_size,
-            device,
-        )
-        posterior = gaussian_lstm(
-            args.g_dim,
-            args.z_dim,
-            args.rnn_size,
-            args.posterior_rnn_layers,
-            args.batch_size,
-            device,
-        )
-        frame_predictor.apply(init_weights)
-        posterior.apply(init_weights)
-
-    if args.model_dir != "":
-        decoder = saved_model["decoder"]
-        encoder = saved_model["encoder"]
-    else:
-        encoder = vgg_encoder(args.g_dim)
-        decoder = vgg_decoder(args.g_dim)
-        encoder.apply(init_weights)
-        decoder.apply(init_weights)
-
-    # --------- transfer to device ------------------------------------
-    frame_predictor.to(device)
-    posterior.to(device)
-    encoder.to(device)
-    decoder.to(device)
-
     # --------- load a dataset ------------------------------------
     train_data = BairRobotPushingDataset(args, "train")
     validate_data = BairRobotPushingDataset(args, "validate")
@@ -300,8 +258,6 @@ def main():
         drop_last=True,
         pin_memory=True,
     )
-    train_iterator = iter(train_loader)
-
     validate_loader = DataLoader(
         validate_data,
         num_workers=args.num_workers,
@@ -311,66 +267,84 @@ def main():
         pin_memory=True,
     )
 
-    validate_iterator = iter(validate_loader)
+    # ------------ build the models  --------------
+
+    if args.model_dir != "":
+        model = saved_model["network"]
+    else:
+        model = CVAE(
+            batch_size=args.batch_size,
+            condition_embedding_input_features=7,
+            condition_embedding_output_features=args.c_dim,
+            encoder_input_channels=3,
+            encoder_output_channels=args.g_dim,
+            rnn_hidden_size=args.rnn_size,
+            predictor_rnn_layers=args.predictor_rnn_layers,
+            posterior_rnn_output_size=args.z_dim,
+            posterior_rnn_layers=args.posterior_rnn_layers,
+        )
+        model.apply(init_weights)
+
+    # --------- transfer to device ------------------------------------
+    model.to(device)
 
     # ---------------- optimizers ----------------
     if args.optimizer == "adam":
-        args.optimizer = optim.Adam
+        optimizer = optim.Adam(
+            model.parameters(), lr=args.lr, betas=(args.momentum, 0.999)
+        )
     elif args.optimizer == "rmsprop":
-        args.optimizer = optim.RMSprop
+        optimizer = optim.RMSprop(
+            model.parameters(), lr=args.lr, momentum=args.momentum
+        )
     elif args.optimizer == "sgd":
-        args.optimizer = optim.SGD
+        args.optimizer = optim.SGD(
+            model.parameters(), lr=args.lr, momentum=args.momentum
+        )
     else:
         raise ValueError("Unknown optimizer: %s" % args.optimizer)
 
-    params = (
-        list(frame_predictor.parameters())
-        + list(posterior.parameters())
-        + list(encoder.parameters())
-        + list(decoder.parameters())
-    )
-    optimizer = args.optimizer(params, lr=args.lr, betas=(args.beta1, 0.999))
-    kl_anneal = kl_annealing(args)
+    if args.kl_anneal_cyclical:
+        kl_scheduler = KLAnnealingScheduler(
+            epoch_size=epoch_size,
+            num_of_cycles=args.kl_anneal_cycle,
+            ratio=args.kl_anneal_ratio,
+        )
+    else:
+        kl_scheduler = KLAnnealingScheduler(
+            epoch_size=epoch_size,
+            num_of_cycles=1,
+            ratio=args.kl_anneal_ratio,
+        )
 
-    modules = {
-        "frame_predictor": frame_predictor,
-        "posterior": posterior,
-        "encoder": encoder,
-        "decoder": decoder,
-    }
     # --------- training loop ------------------------------------
 
-    progress = tqdm(total=args.niter)
+    number_of_train_data = len(train_data)
     best_val_psnr = 0
-    for epoch in range(start_epoch, start_epoch + niter):
-        frame_predictor.train()
-        posterior.train()
-        encoder.train()
-        decoder.train()
+    for epoch in tqdm(range(last_epoch + 1, last_epoch + epoch_size + 1)):
+        total_loss = 0
+        total_mse = 0
+        total_kld = 0
 
-        epoch_loss = 0
-        epoch_mse = 0
-        epoch_kld = 0
-
-        for _ in range(args.epoch_size):
-            try:
-                sequence, condition = next(train_iterator)
-            except StopIteration:
-                train_iterator = iter(train_loader)
-                sequence, condition = next(train_iterator)
-
+        model.train()
+        for sequences, conditions in train_loader:
+            sequences = sequences.to(device)
+            conditions = conditions.to(conditions)
             loss, mse, kld = train(
-                sequence, condition, modules, optimizer, kl_anneal, args
+                model, sequences, conditions, optimizer, kl_scheduler, args.tfr
             )
-            epoch_loss += loss
-            epoch_mse += mse
-            epoch_kld += kld
+            total_loss += loss
+            total_mse += mse
+            total_kld += kld
+
+        total_loss /= number_of_train_data
+        total_mse /= number_of_train_data
+        total_kld /= number_of_train_data
 
         if epoch >= args.tfr_start_decay_epoch:
-            ### Update teacher forcing ratio ###
+            # Update teacher forcing ratio
             raise NotImplementedError
 
-        progress.update(1)
         with open(
             "./{}/train_record.txt".format(args.log_dir), "a"
         ) as train_record:
@@ -379,71 +353,68 @@ def main():
                     "[epoch: %02d] loss: %.5f | mse loss: %.5f | kld loss: %.5f\n"
                     % (
                         epoch,
-                        epoch_loss / args.epoch_size,
-                        epoch_mse / args.epoch_size,
-                        epoch_kld / args.epoch_size,
+                        total_loss,
+                        total_mse,
+                        total_kld,
                     )
                 )
             )
 
-        frame_predictor.eval()
-        encoder.eval()
-        decoder.eval()
-        posterior.eval()
+        # model.eval()
 
-        if epoch % 5 == 0:
-            psnr_list = []
-            for _ in range(len(validate_data) // args.batch_size):
-                try:
-                    validate_seq, validate_cond = next(validate_iterator)
-                except StopIteration:
-                    validate_iterator = iter(validate_loader)
-                    validate_seq, validate_cond = next(validate_iterator)
+        # if epoch % 5 == 0:
+        #     psnr_list = []
+        #     for _ in range(len(validate_data) // args.batch_size):
+        #         try:
+        #             validate_seq, validate_cond = next(validate_iterator)
+        #         except StopIteration:
+        #             validate_iterator = iter(validate_loader)
+        #             validate_seq, validate_cond = next(validate_iterator)
 
-                pred_seq = pred(
-                    validate_seq, validate_cond, modules, args, device
-                )
-                _, _, psnr = finn_eval_seq(
-                    validate_seq[args.n_past :], pred_seq[args.n_past :]
-                )
-                psnr_list.append(psnr)
+        #         pred_seq = pred(
+        #             validate_seq, validate_cond, modules, args, device
+        #         )
+        #         _, _, psnr = finn_eval_seq(
+        #             validate_seq[args.n_past :], pred_seq[args.n_past :]
+        #         )
+        #         psnr_list.append(psnr)
 
-            ave_psnr = np.mean(np.concatenate(psnr_list))
+        #     ave_psnr = np.mean(np.concatenate(psnr_list))
 
-            with open(
-                "./{}/train_record.txt".format(args.log_dir), "a"
-            ) as train_record:
-                train_record.write(
-                    (
-                        "====================== validate psnr = {:.5f} ========================\n".format(
-                            ave_psnr
-                        )
-                    )
-                )
+        #     with open(
+        #         "./{}/train_record.txt".format(args.log_dir), "a"
+        #     ) as train_record:
+        #         train_record.write(
+        #             (
+        #                 "====================== validate psnr = {:.5f} ========================\n".format(
+        #                     ave_psnr
+        #                 )
+        #             )
+        #         )
 
-            if ave_psnr > best_val_psnr:
-                best_val_psnr = ave_psnr
-                # save the model
-                torch.save(
-                    {
-                        "encoder": encoder,
-                        "decoder": decoder,
-                        "frame_predictor": frame_predictor,
-                        "posterior": posterior,
-                        "args": args,
-                        "last_epoch": epoch,
-                    },
-                    "%s/model.pth" % args.log_dir,
-                )
+        #     if ave_psnr > best_val_psnr:
+        #         best_val_psnr = ave_psnr
+        #         # save the model
+        #         torch.save(
+        #             {
+        #                 "encoder": encoder,
+        #                 "decoder": decoder,
+        #                 "frame_predictor": frame_predictor,
+        #                 "posterior": posterior,
+        #                 "args": args,
+        #                 "last_epoch": epoch,
+        #             },
+        #             "%s/model.pth" % args.log_dir,
+        #         )
 
-        if epoch % 20 == 0:
-            try:
-                validate_seq, validate_cond = next(validate_iterator)
-            except StopIteration:
-                validate_iterator = iter(validate_loader)
-                validate_seq, validate_cond = next(validate_iterator)
+        # if epoch % 20 == 0:
+        #     try:
+        #         validate_seq, validate_cond = next(validate_iterator)
+        #     except StopIteration:
+        #         validate_iterator = iter(validate_loader)
+        #         validate_seq, validate_cond = next(validate_iterator)
 
-            plot_pred(validate_seq, validate_cond, modules, epoch, args)
+        #     plot_pred(validate_seq, validate_cond, modules, epoch, args)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,7 @@
 import torch
 import os
-import numpy as np
 import csv
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
 
@@ -18,11 +17,6 @@ class BairRobotPushingDataset(Dataset):
         assert mode == "train" or mode == "test" or mode == "validate"
         self.root = "{}/{}".format(args.data_root, mode)
         self.seq_len = max(args.n_past + args.n_future, args.n_eval)
-        self.mode = mode
-        if mode == "train":
-            self.ordered = False
-        else:
-            self.ordered = True
 
         self.transform = transform
         self.dirs = []
@@ -30,41 +24,20 @@ class BairRobotPushingDataset(Dataset):
             for dir2 in os.listdir(os.path.join(self.root, dir1)):
                 self.dirs.append(os.path.join(self.root, dir1, dir2))
 
-        self.seed_is_set = False
-        self.idx = 0
-        self.cur_dir = self.dirs[0]
-
-    def set_seed(self, seed):
-        if not self.seed_is_set:
-            self.seed_is_set = True
-            np.random.seed(seed)
-
     def __len__(self):
         return len(self.dirs)
 
-    def get_seq(self):
-        if self.ordered:
-            self.cur_dir = self.dirs[self.d]
-            if self.idx == len(self.dirs) - 1:
-                self.idx = 0
-            else:
-                self.idx += 1
-        else:
-            self.cur_dir = self.dirs[np.random.randint(len(self.dirs))]
-
+    def _get_sequence(self, dir: str) -> torch.Tensor:
         image_seq = []
         for i in range(self.seq_len):
-            fname = "{}/{}.png".format(self.cur_dir, i)
-            img = Image.open(fname)
-            image_seq.append(self.transform(img))
+            fname = "{}/{}.png".format(dir, i)
+            image_seq.append(self.transform(Image.open(fname)))
         image_seq = torch.stack(image_seq)
 
         return image_seq
 
-    def get_csv(self):
-        with open(
-            "{}/actions.csv".format(self.cur_dir), newline=""
-        ) as csvfile:
+    def _get_csv(self, dir: str) -> torch.Tensor:
+        with open("{}/actions.csv".format(dir), newline="") as csvfile:
             rows = csv.reader(csvfile)
             actions = []
             for i, row in enumerate(rows):
@@ -76,7 +49,7 @@ class BairRobotPushingDataset(Dataset):
             actions = torch.stack(actions)
 
         with open(
-            "{}/endeffector_positions.csv".format(self.cur_dir), newline=""
+            "{}/endeffector_positions.csv".format(dir), newline=""
         ) as csvfile:
             rows = csv.reader(csvfile)
             positions = []
@@ -87,12 +60,26 @@ class BairRobotPushingDataset(Dataset):
                 positions.append(torch.tensor(position))
             positions = torch.stack(positions)
 
-        condition = torch.cat((actions, positions), axis=1)
+        return torch.concat((actions, positions), dim=1)
 
-        return condition
-
-    def __getitem__(self, index):
-        self.set_seed(index)
-        sequence = self.get_seq()
-        condition = self.get_csv()
+    def __getitem__(self, index: int):
+        dir = self.dirs[index]
+        sequence = self._get_sequence(dir)
+        condition = self._get_csv(dir)
         return sequence, condition
+
+
+if __name__ == "__main__":
+    train_data = BairRobotPushingDataset("train")
+    train_loader = DataLoader(
+        train_data,
+        num_workers=3,
+        batch_size=10,
+        shuffle=True,
+        drop_last=True,
+        pin_memory=False,
+    )
+    train_iterator = iter(train_loader)
+    data = next(train_iterator)
+    print("Sequence size:", data[0].size(), "Condition size:", data[1].size())
+    print(data[1][0][0])
