@@ -17,6 +17,8 @@ class BairRobotPushingDataset(Dataset):
         assert mode == "train" or mode == "test" or mode == "validate"
         self.root = "{}/{}".format(args.data_root, mode)
         self.seq_len = max(args.n_past + args.n_future, args.n_eval)
+        # self.root = "data/train"
+        # self.seq_len = 30
 
         self.transform = transform
         self.dirs = []
@@ -69,6 +71,11 @@ class BairRobotPushingDataset(Dataset):
         return sequence, condition
 
 
+def data_collate_fn(data):
+    data = torch.utils.data.default_collate(data)
+    return data[0].transpose(1, 0), data[1].transpose(1, 0)
+
+
 if __name__ == "__main__":
     train_data = BairRobotPushingDataset("train")
     train_loader = DataLoader(
@@ -77,9 +84,11 @@ if __name__ == "__main__":
         batch_size=10,
         shuffle=True,
         drop_last=True,
-        pin_memory=False,
+        pin_memory=True,
+        collate_fn=data_collate_fn,
     )
-    train_iterator = iter(train_loader)
-    data = next(train_iterator)
-    print("Sequence size:", data[0].size(), "Condition size:", data[1].size())
-    print(data[1][0][0])
+
+    for data in train_loader:
+        print(
+            "Sequence size:", data[0].size(), "Condition size:", data[1].size()
+        )

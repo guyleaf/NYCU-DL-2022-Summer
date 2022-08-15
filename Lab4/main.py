@@ -5,19 +5,14 @@ import random
 import numpy as np
 import torch
 import torch.optim as optim
+from torch.nn import MSELoss
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from models import CVAE
-from dataset import BairRobotPushingDataset
-from schedulers import KLAnnealingScheduler
-from utils import (
-    init_weights,
-    kl_criterion,
-    plot_pred,
-    finn_eval_seq,
-    evaluate,
-)
+from dataset import BairRobotPushingDataset, data_collate_fn
+from schedulers import KLAnnealingScheduler, TeacherForcingScheduler
+from utils import init_weights, kl_criterion, finn_eval_seq, show_curves
 
 torch.backends.cudnn.benchmark = True
 
@@ -38,7 +33,7 @@ def parse_args():
     )
     parser.add_argument(
         "--data_root",
-        default="./data/processed_data",
+        default="./data",
         help="root directory for data",
     )
     parser.add_argument(
@@ -75,22 +70,34 @@ def parse_args():
         help="The lower bound of teacher forcing ratio for scheduling teacher forcing ratio (0 ~ 1)",
     )
     parser.add_argument(
+        "--kl_anneal_beta",
+        type=float,
+        default=0.6,
+        help="The trade-off between minimizing reconstruction error and KL divergence",
+    )
+    parser.add_argument(
+        "--kl_anneal_scheduler",
+        default=False,
+        action="store_true",
+        help="use KL scheduler",
+    )
+    parser.add_argument(
         "--kl_anneal_cyclical",
         default=False,
         action="store_true",
-        help="use cyclical mode",
+        help="use cyclical mode, otherwise monotonic mode (if kl_anneal_scheduler is enabled)",
     )
     parser.add_argument(
         "--kl_anneal_ratio",
         type=float,
         default=0.5,
-        help="The decay ratio of kl annealing",
+        help="The decay ratio of kl annealing (if kl_anneal_scheduler is enabled)",
     )
     parser.add_argument(
         "--kl_anneal_cycle",
         type=int,
         default=3,
-        help="The number of cycle for kl annealing during training (if use cyclical mode)",
+        help="The number of cycle for kl annealing during training (if kl_anneal_scheduler is enabled and use cyclical mode)",
     )
     parser.add_argument("--seed", default=1, type=int, help="manual seed")
     parser.add_argument(
@@ -153,8 +160,11 @@ def train(
     sequences: torch.Tensor,
     conditions: torch.Tensor,
     optimizer: torch.optim.Optimizer,
-    scheduler: KLAnnealingScheduler,
+    kl_beta: float,
     teacher_forcing_ratio: float,
+    n_past: int,
+    last_frame_skip: bool = False,
+    device: str = "cuda",
 ):
     mse = 0
     kld = 0
@@ -162,40 +172,74 @@ def train(
         True if random.random() < teacher_forcing_ratio else False
     )
 
-    model.init_hiddens()
-    for i, x in enumerate(sequences):
-        c = conditions[i]
-        raise NotImplementedError
+    model.init_hiddens(device)
+    loss = MSELoss(reduction="sum")
+    for t, x_t in enumerate(sequences, start=1):
+        update_skips = last_frame_skip or t < n_past
 
-    beta = scheduler.get_beta()
-    loss = mse + kld * beta
+        if use_teacher_forcing or t < n_past:
+            x_t_1 = sequences[t - 1]
+
+        c = conditions[t - 1]
+        x_t_pred, mu, logvar = model(x_t_1, c, x_t, update_skips)
+        mse = mse + loss(x_t_pred, x_t)
+        kld = kld + kl_criterion(mu, logvar)
+
+        x_t_1 = x_t_pred
+
+    loss = mse + kld * kl_beta
     loss.backward()
 
     optimizer.step()
-    scheduler.step()
     optimizer.zero_grad()
 
-    length_of_sequence = x.size(0)
+    length_of_sequence = sequences.size(0)
     return (
-        loss.detach().cpu().numpy() / length_of_sequence,
-        mse.detach().cpu().numpy() / length_of_sequence,
-        kld.detach().cpu().numpy() / length_of_sequence,
+        loss.detach().cpu().item() / length_of_sequence,
+        mse.detach().cpu().item() / length_of_sequence,
+        kld.detach().cpu().item() / length_of_sequence,
     )
+
+
+@torch.no_grad()
+def evaluate(
+    model: CVAE,
+    sequences: torch.Tensor,
+    conditions: torch.Tensor,
+    n_past: int,
+    last_frame_skip: bool = False,
+    device: str = "cuda",
+):
+    pred_sequences = []
+    model.init_hiddens(device)
+    for t, x in enumerate(sequences):
+        update_skips = last_frame_skip or t < n_past
+
+        if t < n_past:
+            x_t = x
+
+        c = conditions[t]
+        x_t_pred = model.predict(x_t, c, update_skips)
+
+        x_t = x_t_pred
+        pred_sequences.append(x_t_pred.cpu().numpy())
+
+    return np.stack(pred_sequences, axis=0)
 
 
 def main():
     args = parse_args()
+    assert args.n_past + args.n_future <= 30 and args.n_eval <= 30
+    assert 0 <= args.tfr and args.tfr <= 1
+    assert 0 <= args.tfr_start_decay_epoch
+    assert 0 <= args.tfr_decay_step and args.tfr_decay_step <= 1
+
     if torch.cuda.is_available():
         print("Use gpu to train the model.")
         device = "cuda"
     else:
         print("Use cpu to train the model.")
         device = "cpu"
-
-    assert args.n_past + args.n_future <= 30 and args.n_eval <= 30
-    assert 0 <= args.tfr and args.tfr <= 1
-    assert 0 <= args.tfr_start_decay_epoch
-    assert 0 <= args.tfr_decay_step and args.tfr_decay_step <= 1
 
     if args.model_dir != "":
         # load model and continue training from checkpoint
@@ -248,23 +292,25 @@ def main():
         train_record.write("args: {}\n".format(args))
 
     # --------- load a dataset ------------------------------------
-    train_data = BairRobotPushingDataset(args, "train")
-    validate_data = BairRobotPushingDataset(args, "validate")
-    train_loader = DataLoader(
-        train_data,
+    training_data = BairRobotPushingDataset(args, "train")
+    validation_data = BairRobotPushingDataset(args, "validate")
+    training_loader = DataLoader(
+        training_data,
         num_workers=args.num_workers,
         batch_size=args.batch_size,
         shuffle=True,
         drop_last=True,
         pin_memory=True,
+        collate_fn=data_collate_fn,
     )
-    validate_loader = DataLoader(
-        validate_data,
+    validation_loader = DataLoader(
+        validation_data,
         num_workers=args.num_workers,
         batch_size=args.batch_size,
         shuffle=True,
         drop_last=True,
         pin_memory=True,
+        collate_fn=data_collate_fn,
     )
 
     # ------------ build the models  --------------
@@ -304,46 +350,82 @@ def main():
     else:
         raise ValueError("Unknown optimizer: %s" % args.optimizer)
 
-    if args.kl_anneal_cyclical:
-        kl_scheduler = KLAnnealingScheduler(
-            epoch_size=epoch_size,
-            num_of_cycles=args.kl_anneal_cycle,
-            ratio=args.kl_anneal_ratio,
-        )
+    if args.kl_anneal_scheduler:
+        if args.kl_anneal_cyclical:
+            kl_scheduler = KLAnnealingScheduler(
+                epoch_size=epoch_size,
+                num_of_cycles=args.kl_anneal_cycle,
+                ratio=args.kl_anneal_ratio,
+                initial_epoch=last_epoch,
+            )
+        else:
+            kl_scheduler = KLAnnealingScheduler(
+                epoch_size=epoch_size,
+                num_of_cycles=1,
+                ratio=args.kl_anneal_ratio,
+                initial_epoch=last_epoch,
+            )
     else:
-        kl_scheduler = KLAnnealingScheduler(
-            epoch_size=epoch_size,
-            num_of_cycles=1,
-            ratio=args.kl_anneal_ratio,
-        )
+        kl_scheduler = None
+        kl_beta = args.kl_anneal_beta
+
+    teacher_forcing_scheduler = TeacherForcingScheduler(
+        ratio=args.tfr,
+        start_decay_epoch=args.tfr_start_decay_epoch,
+        decay_step=args.tfr_decay_step,
+        min_ratio=args.tfr_lower_bound,
+        initial_epoch=last_epoch,
+    )
 
     # --------- training loop ------------------------------------
 
-    number_of_train_data = len(train_data)
+    number_of_train_data = len(training_data)
     best_val_psnr = 0
-    for epoch in tqdm(range(last_epoch + 1, last_epoch + epoch_size + 1)):
+    kl_weights = []
+    tfrs = []
+    train_losses = []
+    average_psnrs = []
+    for epoch in tqdm(range(last_epoch, last_epoch + epoch_size)):
         total_loss = 0
         total_mse = 0
         total_kld = 0
 
+        teacher_forcing_ratio = teacher_forcing_scheduler.get_ratio()
+        if kl_scheduler is not None:
+            kl_beta = kl_scheduler.get_beta()
+
         model.train()
-        for sequences, conditions in train_loader:
+        for sequences, conditions in training_loader:
             sequences = sequences.to(device)
-            conditions = conditions.to(conditions)
+            conditions = conditions.to(device)
+
             loss, mse, kld = train(
-                model, sequences, conditions, optimizer, kl_scheduler, args.tfr
+                model,
+                sequences,
+                conditions,
+                optimizer,
+                kl_beta,
+                teacher_forcing_ratio,
+                args.n_past,
+                args.last_frame_skip,
+                device,
             )
+
             total_loss += loss
             total_mse += mse
             total_kld += kld
+
+        teacher_forcing_scheduler.step()
+        if kl_scheduler is not None:
+            kl_scheduler.step()
 
         total_loss /= number_of_train_data
         total_mse /= number_of_train_data
         total_kld /= number_of_train_data
 
-        if epoch >= args.tfr_start_decay_epoch:
-            # Update teacher forcing ratio
-            raise NotImplementedError
+        kl_weights.append(kl_beta)
+        tfrs.append(teacher_forcing_ratio)
+        train_losses.append(total_loss)
 
         with open(
             "./{}/train_record.txt".format(args.log_dir), "a"
@@ -360,61 +442,58 @@ def main():
                 )
             )
 
-        # model.eval()
+        model.eval()
 
-        # if epoch % 5 == 0:
-        #     psnr_list = []
-        #     for _ in range(len(validate_data) // args.batch_size):
-        #         try:
-        #             validate_seq, validate_cond = next(validate_iterator)
-        #         except StopIteration:
-        #             validate_iterator = iter(validate_loader)
-        #             validate_seq, validate_cond = next(validate_iterator)
+        if epoch % 5 == 0:
+            n_past = args.n_past
+            psnr_list = []
+            for (
+                val_sequences,
+                val_conditions,
+            ) in validation_loader:
+                val_sequences = val_sequences.to(device)
+                val_conditions = val_conditions.to(device)
+                pred_sequences = evaluate(
+                    model,
+                    val_sequences,
+                    val_conditions,
+                    n_past,
+                    args.last_frame_skip,
+                    device,
+                )
+                _, _, psnr = finn_eval_seq(
+                    val_sequences[n_past:].cpu().numpy(),
+                    pred_sequences[n_past:],
+                )
+                psnr_list.append(psnr)
+            ave_psnr = np.mean(np.concatenate(psnr_list))
 
-        #         pred_seq = pred(
-        #             validate_seq, validate_cond, modules, args, device
-        #         )
-        #         _, _, psnr = finn_eval_seq(
-        #             validate_seq[args.n_past :], pred_seq[args.n_past :]
-        #         )
-        #         psnr_list.append(psnr)
+            average_psnrs.append(ave_psnr)
 
-        #     ave_psnr = np.mean(np.concatenate(psnr_list))
+            with open(
+                "./{}/train_record.txt".format(args.log_dir), "a"
+            ) as train_record:
+                train_record.write(
+                    (
+                        "====================== validate psnr = {:.5f} ========================\n".format(
+                            ave_psnr
+                        )
+                    )
+                )
 
-        #     with open(
-        #         "./{}/train_record.txt".format(args.log_dir), "a"
-        #     ) as train_record:
-        #         train_record.write(
-        #             (
-        #                 "====================== validate psnr = {:.5f} ========================\n".format(
-        #                     ave_psnr
-        #                 )
-        #             )
-        #         )
+            if ave_psnr > best_val_psnr:
+                best_val_psnr = ave_psnr
+                # save the model
+                torch.save(
+                    {
+                        "network": model,
+                        "args": args,
+                        "last_epoch": epoch,
+                    },
+                    "%s/model.pth" % args.log_dir,
+                )
 
-        #     if ave_psnr > best_val_psnr:
-        #         best_val_psnr = ave_psnr
-        #         # save the model
-        #         torch.save(
-        #             {
-        #                 "encoder": encoder,
-        #                 "decoder": decoder,
-        #                 "frame_predictor": frame_predictor,
-        #                 "posterior": posterior,
-        #                 "args": args,
-        #                 "last_epoch": epoch,
-        #             },
-        #             "%s/model.pth" % args.log_dir,
-        #         )
-
-        # if epoch % 20 == 0:
-        #     try:
-        #         validate_seq, validate_cond = next(validate_iterator)
-        #     except StopIteration:
-        #         validate_iterator = iter(validate_loader)
-        #         validate_seq, validate_cond = next(validate_iterator)
-
-        #     plot_pred(validate_seq, validate_cond, modules, epoch, args)
+    show_curves(args.log_dir, kl_weights, tfrs, train_losses, average_psnrs)
 
 
 if __name__ == "__main__":

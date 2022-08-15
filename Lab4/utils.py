@@ -1,24 +1,20 @@
 import math
-from operator import pos
-import imageio
+from typing import List
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
+import torch.nn.init as init
 from PIL import Image, ImageDraw
 from scipy import signal
 from skimage.metrics import peak_signal_noise_ratio as psnr_metric
 from skimage.metrics import structural_similarity as ssim_metric
-from torch.autograd import Variable
-from torchvision import transforms
 from torchvision.utils import save_image
 
 
-def kl_criterion(mu, logvar, args):
+def kl_criterion(mu: torch.Tensor, logvar: torch.Tensor):
     # derivation: https://stats.stackexchange.com/a/7443
     # 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
-    KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    KLD /= args.batch_size
-    return KLD
+    return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
 
 def eval_seq(gt, pred):
@@ -56,8 +52,8 @@ def finn_eval_seq(gt, pred):
     mse = np.zeros((bs, T))
     for i in range(bs):
         for t in range(T):
-            origin = gt[t][i].detach().cpu().numpy()
-            predict = pred[t][i].detach().cpu().numpy()
+            origin = gt[t][i]
+            predict = pred[t][i]
             for c in range(origin.shape[0]):
                 res = finn_ssim(origin[c], predict[c]).mean()
                 if math.isnan(res):
@@ -119,11 +115,58 @@ def finn_ssim(img1, img2, data_range=1.0, cs_map=False):
         )
 
 
-def init_weights(m):
+def init_weights(m: torch.nn.Module):
     classname = m.__class__.__name__
     if classname.find("Conv") != -1 or classname.find("Linear") != -1:
-        m.weight.data.normal_(0.0, 0.02)
-        m.bias.data.fill_(0)
+        init.normal_(m.weight, 0.0, 0.02)
+        if m.bias is not None:
+            init.constant_(m.bias, 0.0)
     elif classname.find("BatchNorm") != -1:
-        m.weight.data.normal_(1.0, 0.02)
-        m.bias.data.fill_(0)
+        init.normal_(m.weight, 1.0, 0.02)
+        init.constant_(m.bias, 0.0)
+
+
+def show_curves(
+    saved_path: str,
+    kl_weights: List[float],
+    tfrs: List[float],
+    losses: List[float],
+    average_psnrs: List[float],
+):
+    epochs = list(range(1, len(kl_weights) + 1))
+    plt.figure()
+    plt.title("train loss")
+    plt.xlabel("epoch")
+    plt.ylabel("score/weight")
+    plt.plot(
+        epochs, kl_weights, linestyle="dashed", color="g", label="KL weight"
+    )
+    plt.plot(epochs, tfrs, linestyle="dashed", color="b", label="tfr")
+    plt.plot(epochs, losses, color="r", label="loss")
+    plt.legend()
+    plt.savefig(f"{saved_path}/train_loss.png")
+
+    plt.figure()
+    plt.title("train loss")
+    plt.xlabel("epoch")
+    plt.ylabel("score/weight")
+    plt.plot(
+        epochs, kl_weights, linestyle="dashed", color="g", label="KL weight"
+    )
+    plt.plot(epochs, tfrs, linestyle="dashed", color="b", label="tfr")
+    plt.plot(
+        epochs[::5],
+        average_psnrs,
+        linestyle="dashdot",
+        color="r",
+        label="psnr",
+    )
+    plt.legend()
+    plt.savefig(f"{saved_path}/psnr.png")
+
+
+if __name__ == "__main__":
+    a = np.random.rand(50)
+    losses = np.random.rand(50)
+    psnrs = np.random.rand(10)
+    show_curves("./", np.random.rand(50), a[::-1], losses, psnrs)

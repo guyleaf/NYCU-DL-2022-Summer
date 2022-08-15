@@ -118,7 +118,7 @@ class Decoder(nn.Module):
         h = self.upsampling(h)
 
         number_of_upconvs = len(self.upconvs)
-        for i, upconv in self.upconvs:
+        for i, upconv in enumerate(self.upconvs):
             h = upconv(torch.concat([h, skips[number_of_upconvs - i]], dim=1))
             h = self.upsampling(h)
 
@@ -130,7 +130,7 @@ class EmbeddedLSTM(nn.Module):
     lstm: nn.ModuleList
     fcn: nn.Module
 
-    _hiddens: torch.Tensor
+    _hiddens: List[torch.Tensor]
 
     def __init__(
         self,
@@ -151,19 +151,25 @@ class EmbeddedLSTM(nn.Module):
             nn.Tanh(),
         )
 
-        self._hiddens = torch.zeros(
-            num_layers, batch_size, hidden_size, requires_grad=True
-        )
+        self._hiddens = []
+        for _ in range(num_layers):
+            self._hiddens.append(torch.zeros(2, batch_size, hidden_size))
 
-    def init_hiddens(self):
-        self._hiddens = torch.zeros_like(self._hiddens, requires_grad=True)
+    def init_hiddens(self, device):
+        for i in range(len(self._hiddens)):
+            self._hiddens[i] = self._hiddens[i].to(device)
+            self._hiddens[i].data.fill_(0)
 
     def forward(self, x: torch.Tensor):
         h_in = self.embedding(x)
         # TODO: Check if it is bug
         for i, layer in enumerate(self.lstm):
-            self._hiddens[i] = layer(h_in, self._hiddens[i])
-            h_in = self._hiddens[i][0]
+            h_0, c_0 = self._hiddens[i]
+            h_in, c_n = torch.stack(layer(h_in, (h_0, c_0)), dim=0)
+            self._hiddens[i] = torch.stack(
+                [h_in.detach(), c_n.detach()], dim=0
+            )
+
         return self.fcn(h_in)
 
 
@@ -173,7 +179,7 @@ class EmbeddedLSTMWithGaussian(nn.Module):
     mu_fcn: nn.Module
     logvar_fcn: nn.Module
 
-    _hiddens: torch.Tensor
+    _hiddens: nn.Parameter
 
     def __init__(
         self,
@@ -191,12 +197,14 @@ class EmbeddedLSTMWithGaussian(nn.Module):
         self.mu_fcn = nn.Linear(hidden_size, output_size)
         self.logvar_fcn = nn.Linear(hidden_size, output_size)
 
-        self._hiddens = torch.zeros(
-            num_layers, batch_size, hidden_size, requires_grad=True
-        )
+        self._hiddens = []
+        for _ in range(num_layers):
+            self._hiddens.append(torch.zeros(2, batch_size, hidden_size))
 
-    def init_hiddens(self):
-        self._hiddens = torch.zeros_like(self._hiddens, requires_grad=True)
+    def init_hiddens(self, device):
+        for i in range(len(self._hiddens)):
+            self._hiddens[i] = self._hiddens[i].to(device)
+            self._hiddens[i].data.fill_(0)
 
     def _reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor):
         std = torch.exp(0.5 * logvar)
@@ -206,8 +214,12 @@ class EmbeddedLSTMWithGaussian(nn.Module):
     def forward(self, x: torch.Tensor):
         h_in = self.embedding(x)
         for i, layer in enumerate(self.lstm):
-            self._hiddens[i] = layer(h_in, self._hiddens[i])
-            h_in = self._hiddens[i][0]
+            h_0, c_0 = self._hiddens[i]
+            h_in, c_n = layer(h_in, (h_0, c_0))
+            self._hiddens[i] = torch.stack(
+                [h_in.detach(), c_n.detach()], dim=0
+            )
+
         mu = self.mu_fcn(h_in)
         logvar = self.logvar_fcn(h_in)
         z = self._reparameterize(mu, logvar)
@@ -222,6 +234,7 @@ class CVAE(nn.Module):
     decoder: Decoder
 
     _encoder_skips: List[torch.Tensor]
+    _z_dim: int
 
     def __init__(
         self,
@@ -263,10 +276,35 @@ class CVAE(nn.Module):
         self.decoder = Decoder(in_channels=encoder_output_channels)
 
         self._encoder_skips = []
+        self._z_dim = posterior_rnn_output_size
 
-    def init_hiddens(self):
-        self.predictor.init_hiddens()
-        self.posterior.init_hiddens()
+    def init_hiddens(self, device: str):
+        self.predictor.init_hiddens(device)
+        self.posterior.init_hiddens(device)
+
+    def predict(
+        self,
+        x: torch.Tensor,
+        condition: torch.Tensor,
+        update_skips: bool = True,
+    ) -> torch.Tensor:
+        condition = self.condition_embedding(condition)
+        # batch_size, channels, x, x
+        if update_skips:
+            h, self._encoder_skips = self.encoder(x)
+        else:
+            h, _ = self.encoder(x)
+
+        # sample from N(0, 1)
+        z = torch.randn(h.size(0), self._z_dim, device=h.device)
+
+        # frame predictor
+        # batch_size, input_size
+        g = self.predictor(torch.concat([condition, h, z], dim=1))
+        # batch_size, output_size
+        x_pred = self.decoder(g, self._encoder_skips)
+
+        return x_pred
 
     def forward(
         self,
@@ -281,6 +319,7 @@ class CVAE(nn.Module):
             h, self._encoder_skips = self.encoder(x)
         else:
             h, _ = self.encoder(x)
+
         h_target, _ = self.encoder(target)
 
         # inference network
