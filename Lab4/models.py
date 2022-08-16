@@ -282,7 +282,34 @@ class CVAE(nn.Module):
         self.predictor.init_hiddens(device)
         self.posterior.init_hiddens(device)
 
-    def predict(
+    def sample_from_posterior(
+        self,
+        x: torch.Tensor,
+        condition: torch.Tensor,
+        target: torch.Tensor,
+        update_skips: bool = True,
+    ):
+        condition = self.condition_embedding(condition)
+        # batch_size, channels, x, x
+        if update_skips:
+            h, self._encoder_skips = self.encoder(x)
+        else:
+            h, _ = self.encoder(x)
+
+        h_target, _ = self.encoder(target)
+
+        # sample mean from posterier
+        _, z, _ = self.posterior(h_target)
+
+        # frame predictor
+        # batch_size, input_size
+        g = self.predictor(torch.concat([condition, h, z], dim=1))
+        # batch_size, output_size
+        x_pred = self.decoder(g, self._encoder_skips)
+
+        return x_pred
+
+    def sample(
         self,
         x: torch.Tensor,
         condition: torch.Tensor,

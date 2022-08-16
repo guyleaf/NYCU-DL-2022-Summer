@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 import os
 import csv
 from torch.utils.data import Dataset, DataLoader
@@ -13,18 +14,29 @@ default_transform = transforms.Compose(
 
 
 class BairRobotPushingDataset(Dataset):
-    def __init__(self, args, mode="train", transform=default_transform):
+    def __init__(
+        self,
+        root_path,
+        sequence_length,
+        data_samples=1,
+        mode="train",
+        transform=default_transform,
+    ):
+        assert root_path != ""
+        assert sequence_length > 1 and data_samples > 0
         assert mode == "train" or mode == "test" or mode == "validate"
-        self.root = "{}/{}".format(args.data_root, mode)
-        self.seq_len = max(args.n_past + args.n_future, args.n_eval)
-        # self.root = "data/train"
-        # self.seq_len = 30
+        self.root = f"{root_path}/{mode}"
+        self.seq_len = sequence_length
 
         self.transform = transform
         self.dirs = []
         for dir1 in os.listdir(self.root):
             for dir2 in os.listdir(os.path.join(self.root, dir1)):
                 self.dirs.append(os.path.join(self.root, dir1, dir2))
+
+        if mode != "test":
+            data_samples = min(data_samples, len(self.dirs))
+            self.dirs = (np.random.choice(self.dirs, data_samples)).tolist()
 
     def __len__(self):
         return len(self.dirs)

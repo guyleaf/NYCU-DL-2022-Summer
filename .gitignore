@@ -204,3 +204,4 @@ cython_debug/
 *.zip
 data/
 /Lab*/models
+logs

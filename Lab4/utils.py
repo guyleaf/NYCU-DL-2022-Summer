@@ -1,4 +1,5 @@
 import math
+import imageio
 from typing import List
 import numpy as np
 import matplotlib.pyplot as plt
@@ -8,13 +9,12 @@ from PIL import Image, ImageDraw
 from scipy import signal
 from skimage.metrics import peak_signal_noise_ratio as psnr_metric
 from skimage.metrics import structural_similarity as ssim_metric
-from torchvision.utils import save_image
 
 
 def kl_criterion(mu: torch.Tensor, logvar: torch.Tensor):
     # derivation: https://stats.stackexchange.com/a/7443
     # 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
-    return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / mu.size(0)
 
 
 def eval_seq(gt, pred):
@@ -60,7 +60,9 @@ def finn_eval_seq(gt, pred):
                     ssim[i, t] += -1
                 else:
                     ssim[i, t] += res
-                psnr[i, t] += finn_psnr(origin[c], predict[c])
+                psnr[i, t] += psnr_metric(
+                    origin[c], predict[c], data_range=1.0
+                )
             ssim[i, t] /= origin.shape[0]
             psnr[i, t] /= origin.shape[0]
             mse[i, t] = mse_metric(origin, predict)
@@ -155,7 +157,7 @@ def show_curves(
     )
     plt.plot(epochs, tfrs, linestyle="dashed", color="b", label="tfr")
     plt.plot(
-        epochs[::5],
+        epochs,
         average_psnrs,
         linestyle="dashdot",
         color="r",
@@ -163,6 +165,125 @@ def show_curves(
     )
     plt.legend()
     plt.savefig(f"{saved_path}/psnr.png")
+
+
+def add_border(x: np.ndarray, color: str, pad=1):
+    w = x.shape[1]
+    nc = x.shape[0]
+    px = np.zeros(3, w + 2 * pad + 30, w + 2 * pad)
+    if color == "red":
+        px[0] = 0.7
+    elif color == "green":
+        px[1] = 0.7
+
+    right_pad = w + pad
+    if nc == 1:
+        for c in range(3):
+            px[c, pad:right_pad, pad:right_pad] = x
+    else:
+        px[:, pad:right_pad, pad:right_pad] = x
+    return px
+
+
+def image_tensor(inputs, padding=1):
+    assert len(inputs) > 0
+
+    # if this is a list of lists, unpack them all and grid them up
+    if is_sequence(inputs[0]) or (hasattr(inputs, "dim") and inputs.dim() > 4):
+        images = [image_tensor(x) for x in inputs]
+        if images[0].dim() == 3:
+            c_dim = images[0].size(0)
+            x_dim = images[0].size(1)
+            y_dim = images[0].size(2)
+        else:
+            c_dim = 1
+            x_dim = images[0].size(0)
+            y_dim = images[0].size(1)
+
+        result = torch.ones(
+            c_dim, x_dim * len(images) + padding * (len(images) - 1), y_dim
+        )
+        for i, image in enumerate(images):
+            result[
+                :, i * x_dim + i * padding : (i + 1) * x_dim + i * padding, :
+            ].copy_(image)
+
+        return result
+
+    # if this is just a list, make a stacked image
+    else:
+        images = [
+            x.data if isinstance(x, torch.autograd.Variable) else x
+            for x in inputs
+        ]
+        # print(images)
+        if images[0].dim() == 3:
+            c_dim = images[0].size(0)
+            x_dim = images[0].size(1)
+            y_dim = images[0].size(2)
+        else:
+            c_dim = 1
+            x_dim = images[0].size(0)
+            y_dim = images[0].size(1)
+
+        result = torch.ones(
+            c_dim, x_dim, y_dim * len(images) + padding * (len(images) - 1)
+        )
+        for i, image in enumerate(images):
+            result[
+                :, :, i * y_dim + i * padding : (i + 1) * y_dim + i * padding
+            ].copy_(image)
+        return result
+
+
+def make_gif(
+    origin: np.ndarray,
+    posterior: np.ndarray,
+    best: np.ndarray,
+    random_samples: np.ndarray,
+    n_past: int,
+    path: str,
+    duration: float = 0.25,
+):
+    length_of_sequence = origin.shape[0]
+    gifs = np.empty((length_of_sequence, 1))
+    texts = np.empty_like(gifs)
+    for t in range(length_of_sequence):
+        # gt
+        gifs[t].append(add_border(origin[t], "green"))
+        texts[t].append("Ground\ntruth")
+        # posterior
+        if t < n_past:
+            color = "green"
+        else:
+            color = "red"
+        gifs[t].append(add_border(posterior[t], color))
+        texts[t].append("Approx.\nposterior")
+        # best
+        if t < n_past:
+            color = "green"
+        else:
+            color = "red"
+        gifs[t].append(add_border(best[t], color))
+        texts[t].append("Best SSIM")
+        # random 3
+        for i, sequence in enumerate(random_samples):
+            gifs[t].append(add_border(sequence[t], color))
+            texts[t].append("Random\nsample %d" % (i + 1))
+
+    images = []
+    for gif, _ in zip(gifs, texts):
+        gif = np.clip(gif, 0, 1)
+        images.append(gif)
+    imageio.mimsave(path, images, duration=duration)
+
+
+def export_sequence(sequence: np.ndarray, path: str):
+    imgs = np.empty(sequence.shape[0])
+    for t, img in enumerate(sequence):
+        imgs[t] = add_border(img, "black")
+
+    Image.fromarray()
 
 
 if __name__ == "__main__":
