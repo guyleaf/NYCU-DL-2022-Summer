@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 
-'''===============================================================
+"""===============================================================
 1. Title:     
 
 DLP summer 2022 Lab5 classifier
@@ -28,23 +28,23 @@ images shape: (batch_size, 3, 64, 64)
 labels shape: (batch_size, 24) where labels are one-hot vectors
 e.g. [[1,1,0,...,0],[0,1,1,0,...],...]
 
-==============================================================='''
+==============================================================="""
 
 
-class evaluation_model():
+class EvaluationModel:
     def __init__(self):
-        #modify the path to your own path
-        checkpoint = torch.load('logs/classifier/checkpoint.pth')
-        self.resnet18 = models.resnet18(pretrained=False)
-        self.resnet18.fc = nn.Sequential(
-            nn.Linear(512,24),
-            nn.Sigmoid()
-        )
-        self.resnet18.load_state_dict(checkpoint['model'])
+        # modify the path to your own path
+        checkpoint = torch.load("evaluator.pth")
+        self.resnet18 = models.resnet18(weights=None)
+        self.resnet18.fc = nn.Sequential(nn.Linear(512, 24), nn.Sigmoid())
+        self.resnet18.load_state_dict(checkpoint["model"])
         self.resnet18 = self.resnet18.cuda()
         self.resnet18.eval()
         self.classnum = 24
-    def compute_acc(self, out, onehot_labels):
+
+    def compute_acc(
+        self, out: torch.Tensor, onehot_labels: torch.Tensor
+    ) -> float:
         batch_size = out.size(0)
         acc = 0
         total = 0
@@ -57,9 +57,10 @@ class evaluation_model():
                 if j in li:
                     acc += 1
         return acc / total
-    def eval(self, images, labels):
-        with torch.no_grad():
-            #your image shape should be (batch, 3, 64, 64)
-            out = self.resnet18(images)
-            acc = self.compute_acc(out.cpu(), labels.cpu())
-            return acc
+
+    @torch.no_grad()
+    def eval(self, images: torch.Tensor, labels: torch.Tensor) -> float:
+        # your image shape should be (batch, 3, 64, 64)
+        out = self.resnet18(images)
+        acc = self.compute_acc(out.cpu(), labels.cpu())
+        return acc
