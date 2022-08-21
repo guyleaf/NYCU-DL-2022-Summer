@@ -1,0 +1,2 @@
+#!/usr/bin/env sh
+python train.py --lr 0.002 --batch_size 8 --save_model_per_epoch --data_root ./data --training_samples 50000 --validation_samples 10000 --optimizer adam --momentum 0.9 --epoch_size 100 --tfr 1.0 --tfr_start_decay_epoch 10 --tfr_decay_step 0.011111 --tfr_lower_bound 0 --kl_anneal_scheduler --kl_anneal_cyclical --kl_anneal_ratio 1.0 --kl_anneal_cycle 2 --seed 1234 --n_past 2 --n_future 10 --rnn_size 256 --c_dim 32 --z_dim 64 --g_dim 128 --num_workers 4

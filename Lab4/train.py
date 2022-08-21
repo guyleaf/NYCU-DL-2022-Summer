@@ -194,9 +194,9 @@ def train(
     model.init_hiddens(device)
     loss_fn = MSELoss(reduction="mean")
     for t, x_t in enumerate(sequences, start=1):
-        update_skips = last_frame_skip or t < n_past
+        update_skips = last_frame_skip or (t - 1) < n_past
 
-        if use_teacher_forcing or t < n_past:
+        if use_teacher_forcing or (t - 1) < n_past:
             x_t_1 = sequences[t - 1]
 
         c = conditions[t - 1]
@@ -251,6 +251,7 @@ def save_model(
     parameters: Dict[str, Any],
     epoch: int,
     args,
+    metrics={},
 ):
     torch.save(
         {
@@ -260,6 +261,7 @@ def save_model(
             },
             "args": args,
             "last_epoch": epoch,
+            "metrics": metrics,
         },
         path,
     )
@@ -294,8 +296,9 @@ def main():
         args.model_file = model_file
         args.data_root = data_root
         args.log_dir = "%s/continued" % args.log_dir
-        last_epoch = saved_model["last_epoch"]
+        start_epoch = saved_model["last_epoch"] + 1
         network = saved_model["network"]
+        metrics = saved_model["metrics"]
     else:
         name = (
             args.custom_log_dir_name
@@ -320,7 +323,13 @@ def main():
         )
 
         args.log_dir = "%s/%s" % (args.log_dir, name)
-        last_epoch = 0
+        start_epoch = 0
+        metrics = {
+            "kl_weights": [],
+            "tfrs": [],
+            "train_losses": [],
+            "average_psnrs": [],
+        }
 
     os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs("%s/models/" % args.log_dir, exist_ok=True)
@@ -422,14 +431,14 @@ def main():
                 epoch_size=args.epoch_size,
                 number_of_cycles=args.kl_anneal_cycle,
                 ratio=args.kl_anneal_ratio,
-                initial_epoch=last_epoch,
+                initial_epoch=start_epoch,
             )
         else:
             kl_scheduler = KLAnnealingScheduler(
                 epoch_size=args.epoch_size,
                 number_of_cycles=1,
                 ratio=args.kl_anneal_ratio,
-                initial_epoch=last_epoch,
+                initial_epoch=start_epoch,
             )
     else:
         kl_scheduler = None
@@ -440,20 +449,19 @@ def main():
         start_decay_epoch=args.tfr_start_decay_epoch,
         decay_step=args.tfr_decay_step,
         min_ratio=args.tfr_lower_bound,
-        initial_epoch=last_epoch,
+        initial_epoch=start_epoch,
     )
 
     # --------- training loop ------------------------------------
 
     number_of_batches = len(training_loader)
     best_val_psnr = 0
-    kl_weights = []
-    tfrs = []
-    train_losses = []
-    average_psnrs = []
     try:
         for epoch in trange(
-            last_epoch, last_epoch + args.epoch_size, desc="Current epoch"
+            start_epoch,
+            args.epoch_size,
+            initial=start_epoch,
+            desc="Current epoch",
         ):
             total_loss = 0
             total_mse = 0
@@ -469,7 +477,7 @@ def main():
                 train_record.write(
                     (
                         "[epoch: %02d] tfr: %.5f | KL weight: %.5f\n"
-                        % (epoch + 1, teacher_forcing_ratio, kl_beta)
+                        % (epoch, teacher_forcing_ratio, kl_beta)
                     )
                 )
 
@@ -504,9 +512,9 @@ def main():
             total_mse /= number_of_batches
             total_kld /= number_of_batches
 
-            kl_weights.append(kl_beta)
-            tfrs.append(teacher_forcing_ratio)
-            train_losses.append(total_loss)
+            metrics["kl_weights"].append(kl_beta)
+            metrics["tfrs"].append(teacher_forcing_ratio)
+            metrics["train_losses"].append(total_loss)
 
             with open(
                 "./{}/train_record.txt".format(args.log_dir), "a"
@@ -515,7 +523,7 @@ def main():
                     (
                         "[epoch: %02d] loss: %.5f | mse loss: %.5f | kld loss: %.5f\n"
                         % (
-                            epoch + 1,
+                            epoch,
                             total_loss,
                             total_mse,
                             total_kld,
@@ -548,7 +556,7 @@ def main():
                 psnr_list.append(psnr)
             ave_psnr = np.mean(np.concatenate(psnr_list))
 
-            average_psnrs.append(ave_psnr)
+            metrics["average_psnrs"].append(ave_psnr)
 
             with open(
                 "./{}/train_record.txt".format(args.log_dir), "a"
@@ -569,6 +577,7 @@ def main():
                     model.state_dict(),
                     epoch,
                     args,
+                    metrics,
                 )
 
             if args.save_model_per_epoch:
@@ -578,11 +587,10 @@ def main():
                     model.state_dict(),
                     epoch,
                     args,
+                    metrics,
                 )
     finally:
-        show_curves(
-            args.log_dir, kl_weights, tfrs, train_losses, average_psnrs
-        )
+        show_curves(args.log_dir, metrics)
 
 
 if __name__ == "__main__":

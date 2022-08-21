@@ -61,8 +61,9 @@ class TeacherForcingScheduler:
         self._min_ratio = min_ratio
 
     def step(self):
+        self._epoch += 1
         if self._epoch >= self._start_decay_epoch:
-            self._ratio = min(self._ratio - self._decay_step, self._min_ratio)
+            self._ratio = max(self._ratio - self._decay_step, self._min_ratio)
 
     def get_ratio(self):
         return self._ratio

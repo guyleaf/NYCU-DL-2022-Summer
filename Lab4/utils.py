@@ -1,6 +1,6 @@
 import math
 import imageio
-from typing import List
+from typing import Dict, List
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
@@ -128,42 +128,72 @@ def init_weights(m: torch.nn.Module):
         init.constant_(m.bias, 0.0)
 
 
-def show_curves(
-    saved_path: str,
-    kl_weights: List[float],
-    tfrs: List[float],
-    losses: List[float],
-    average_psnrs: List[float],
-):
-    epochs = list(range(1, len(kl_weights) + 1))
-    plt.figure()
+def show_curves(saved_path: str, metrics: Dict[str, List[float]]):
+    epochs = list(range(len(metrics["kl_weights"])))
+    _, ax1 = plt.subplots()
     plt.title("train loss")
-    plt.xlabel("epoch")
-    plt.ylabel("score/weight")
-    plt.plot(
-        epochs, kl_weights, linestyle="dashed", color="g", label="KL weight"
+
+    ax1.set_xlabel("epoch")
+    ax1.set_ylabel("ratio/weight", color="b")
+    ax1.tick_params("y", colors="b")
+    ax1.plot(
+        epochs,
+        metrics["kl_weights"],
+        linestyle="dashed",
+        color="g",
+        label="KL weight",
     )
-    plt.plot(epochs, tfrs, linestyle="dashed", color="b", label="tfr")
-    plt.plot(epochs, losses, color="r", label="loss")
-    plt.legend()
+    ax1.plot(
+        epochs, metrics["tfrs"], linestyle="dashed", color="b", label="tfr"
+    )
+
+    ax2 = ax1.twinx()
+    ax2.set_ylabel("loss")
+    ax2.plot(epochs, metrics["train_losses"], color="r", label="loss")
+
+    handles, _ = [
+        (a + b)
+        for a, b in zip(
+            ax1.get_legend_handles_labels(), ax2.get_legend_handles_labels()
+        )
+    ]
+    plt.legend(handles=handles)
     plt.savefig(f"{saved_path}/train_loss.png")
 
-    plt.figure()
-    plt.title("train loss")
-    plt.xlabel("epoch")
-    plt.ylabel("score/weight")
-    plt.plot(
-        epochs, kl_weights, linestyle="dashed", color="g", label="KL weight"
-    )
-    plt.plot(epochs, tfrs, linestyle="dashed", color="b", label="tfr")
-    plt.plot(
+    _, ax1 = plt.subplots()
+    plt.title("Average PSNR")
+
+    ax1.set_xlabel("epoch")
+    ax1.set_ylabel("ratio/weight", color="b")
+    ax1.tick_params("y", colors="b")
+    ax1.plot(
         epochs,
-        average_psnrs,
+        metrics["kl_weights"],
+        linestyle="dashed",
+        color="g",
+        label="KL weight",
+    )
+    ax1.plot(
+        epochs, metrics["tfrs"], linestyle="dashed", color="b", label="tfr"
+    )
+
+    ax2 = ax1.twinx()
+    ax2.set_ylabel("psnr score")
+    ax2.plot(
+        epochs,
+        metrics["average_psnrs"],
         linestyle="dashdot",
         color="r",
         label="psnr",
     )
-    plt.legend()
+
+    handles, _ = [
+        (a + b)
+        for a, b in zip(
+            ax1.get_legend_handles_labels(), ax2.get_legend_handles_labels()
+        )
+    ]
+    plt.legend(handles=handles)
     plt.savefig(f"{saved_path}/psnr.png")
 
 
