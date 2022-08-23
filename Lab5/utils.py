@@ -1,5 +1,7 @@
 ﻿import json
+from typing import Dict, List
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torchvision.utils import make_grid, save_image
@@ -20,11 +22,55 @@ def save_images(path: str, images: torch.Tensor):
     save_image(grid, path)
 
 
+def show_curves(saved_path: str, metrics: Dict[str, List[float]]):
+    epochs = list(range(len(metrics["train_d_loss"])))
+    _, ax1 = plt.subplots()
+    plt.title("train loss")
+
+    ax1.set_xlabel("epoch")
+    ax1.set_ylabel("D loss", color="b")
+    ax1.tick_params("y", colors="b")
+    ax1.plot(
+        epochs,
+        metrics["train_d_loss"],
+        linestyle="dashdot",
+        color="b",
+        label="D loss",
+    )
+
+    ax2 = ax1.twinx()
+    ax2.set_ylabel("G loss", color="g")
+    ax2.tick_params("y", colors="g")
+    ax2.plot(
+        epochs,
+        metrics["train_g_loss"],
+        linestyle="dashdot",
+        color="g",
+        label="G loss",
+    )
+
+    handles, _ = [
+        (a + b)
+        for a, b in zip(
+            ax1.get_legend_handles_labels(), ax2.get_legend_handles_labels()
+        )
+    ]
+    plt.legend(handles=handles)
+    plt.savefig(f"{saved_path}/train_loss.png")
+
+    plt.figure()
+    plt.title("test accuracy")
+    plt.xlabel("epoch")
+    plt.ylabel("accuracy")
+    plt.plot(epochs, metrics["test_accuracy"])
+    plt.savefig(f"{saved_path}/test_accuracy.png")
+
+
 # custom weights initialization
 def weights_init(m):
     classname = m.__class__.__name__
-    if classname.find('Conv') != -1:
+    if classname.find("Conv") != -1 or classname.find("Linear") != -1:
         torch.nn.init.normal_(m.weight, 0.0, 0.02)
-    elif classname.find('BatchNorm') != -1:
+    elif classname.find("BatchNorm") != -1:
         torch.nn.init.normal_(m.weight, 1.0, 0.02)
         torch.nn.init.zeros_(m.bias)

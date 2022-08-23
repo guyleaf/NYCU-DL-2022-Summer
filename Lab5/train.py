@@ -14,52 +14,26 @@ from tqdm import tqdm, trange
 from datasets import CLEVRDataset
 from evaluator import EvaluationModel
 from models import Discriminator, Generator
-from utils import save_images, set_seeds, weights_init
+from utils import save_images, set_seeds, show_curves, weights_init
 
 
 class ArgumentParser(Tap):
-    lr: float = 2e-3  # learning rate
+    generator_lr: float = 2e-4  # learning rate for generator
+    discriminator_lr: float = 2e-4  # learning rate for discriminator
     batch_size: int = 64  # batch size
-    epoch_size: int = 25  # number of epochs to train for
-    momentum: float = 0.9  # momentum of Adam optimizer
+    epoch_size: int = 100  # number of epochs to train for
+    momentum: float = 0.5  # momentum of Adam optimizer
     z_dim: int = 100  # dimensionality of z noise
     model_file: str = ""  # path of model file
     save_model_for_every_epoch: bool = False
     data_dir: str = "./data"  # path of data folder
     log_dir: str = "./logs"
     custom_log_dir_name: str = ""
+    comments: str = ""
     max_objects: int = 3  # maximum objects in one generated image
     seed: int = 1  # manual seed
     num_workers: int = 4  # number of workers for dataloader
     device: str = "cuda"  # device
-
-
-@torch.no_grad()
-def evaluate(
-    args: ArgumentParser,
-    generator: nn.Module,
-    test_dataloader: DataLoader,
-) -> Tuple[float, torch.Tensor]:
-    evaluator = EvaluationModel()
-
-    generator.eval()
-
-    total_accuracy = 0
-    generated_images = []
-    for _, labels in test_dataloader:
-        labels = labels.to(args.device)
-        batch_size = labels.shape[0]
-
-        # sample noises z
-        z = torch.randn((batch_size, args.z_dim, 1, 1), device=args.device)
-
-        sampled_images = generator(z, labels.unsqueeze(-1).unsqueeze(-1))
-        total_accuracy += evaluator.eval(sampled_images, labels)
-
-        generated_images.append(sampled_images.cpu())
-
-    generated_images = torch.concat(generated_images, dim=0)
-    return total_accuracy / len(test_dataloader.dataset), generated_images
 
 
 def save_model(
@@ -84,6 +58,58 @@ def save_model(
     )
 
 
+def sample_noises(args: ArgumentParser, batch_size: int):
+    # sample noises z
+    z = torch.randn(
+        (batch_size, args.z_dim),
+        requires_grad=False,
+        device=args.device,
+    )
+
+    # sample one-hot labels c
+    # use multinomial to avoid generating duplicated labels
+    # discussion: https://discuss.pytorch.org/t/how-to-generate-non-overlap-random-integer-tuple-efficiently/40869/4
+    weights = torch.ones(24, requires_grad=False, device=args.device).expand(
+        batch_size, -1
+    )
+    sampled_labels = torch.multinomial(
+        weights, num_samples=args.max_objects, replacement=False
+    )
+    sampled_labels = torch.sum(
+        F.one_hot(sampled_labels, num_classes=24), dim=1, dtype=torch.float32
+    )
+
+    return z, sampled_labels
+
+
+@torch.no_grad()
+def evaluate(
+    args: ArgumentParser,
+    generator: nn.Module,
+    test_dataloader: DataLoader,
+) -> Tuple[float, torch.Tensor]:
+    evaluator = EvaluationModel()
+
+    generator.eval()
+
+    total_accuracy = 0
+    generated_images = []
+    for _, labels in test_dataloader:
+        labels = labels.to(args.device)
+        batch_size = labels.shape[0]
+
+        # sample noises z
+        z, _ = sample_noises(args, batch_size)
+
+        sampled_images = generator(z, labels)
+        total_accuracy += evaluator.eval(sampled_images, labels)
+
+        generated_images.append(sampled_images.cpu())
+
+    generated_images = torch.concat(generated_images, dim=0)
+    return total_accuracy, generated_images
+
+
 def main():
     args = ArgumentParser().parse_args()
     assert args.device == "cpu" or (
@@ -99,6 +125,7 @@ def main():
         saved_args.epoch_size = args.epoch_size
         saved_args.batch_size = args.batch_size
         saved_args.save_model_for_every_epoch = args.save_model_for_every_epoch
+        saved_args.comments = args.comments
 
         args = saved_args
         args.log_dir = "%s/continued" % args.log_dir
@@ -111,10 +138,11 @@ def main():
             args.custom_log_dir_name
             if args.custom_log_dir_name != ""
             else (
-                "%s-lr=%.5f-momentum=%.5f-z_dim=%d-epoch_size=%d-max_objects=%d"
+                "%s-g_lr=%.5f-d_lr=%.5f-momentum=%.5f-z_dim=%d-epoch_size=%d-max_objects=%d"
                 % (
                     datetime.now().strftime("%Y-%m-%d_%H%M%S"),
-                    args.lr,
+                    args.generator_lr,
+                    args.discriminator_lr,
                     args.momentum,
                     args.z_dim,
                     args.epoch_size,
@@ -125,7 +153,7 @@ def main():
 
         args.log_dir = f"{args.log_dir}/{name}"
         start_epoch = 0
-        metrics = {"test_accuracy": []}
+        metrics = {"train_d_loss": [], "train_g_loss": [], "test_accuracy": []}
         best_test_accuracy = 0
 
     print("Random seed:", args.seed)
@@ -151,6 +179,7 @@ def main():
     # --------- load a dataset ----------------
     train_data = CLEVRDataset(args.data_dir, mode="train")
     test_data = CLEVRDataset(args.data_dir, mode="test")
+    # new_test_data = CLEVRDataset(args.data_dir, mode="new_test")
     train_dataloader = DataLoader(
         train_data,
         batch_size=args.batch_size,
@@ -165,9 +194,17 @@ def main():
         num_workers=args.num_workers,
         pin_memory=True,
     )
+    # new_test_dataloader = DataLoader(
+    #     new_test_data,
+    #     batch_size=args.batch_size,
+    #     shuffle=False,
+    #     num_workers=args.num_workers,
+    #     pin_memory=True,
+    # )
 
     print("Train data samples: ", len(train_data))
     print("Test data samples: ", len(test_data))
+    # print("New Test data samples: ", len(new_test_data))
 
     # --------- build models ------------------
     generator = Generator(args.z_dim + 24, 3)
@@ -184,155 +221,192 @@ def main():
 
     # --------- build optimizers --------------
     generator_optimizer = optim.Adam(
-        generator.parameters(), lr=args.lr, betas=(args.momentum, 0.999)
+        generator.parameters(),
+        lr=args.generator_lr,
+        betas=(args.momentum, 0.999),
     )
-    discriminator_optimizer = optim.Adam(
-        discriminator.parameters(), lr=args.lr, betas=(args.momentum, 0.999)
+    discriminator_optimizer = optim.SGD(
+        discriminator.parameters(),
+        lr=args.discriminator_lr,
+        momentum=args.momentum,
     )
 
-    loss_fn = nn.BCEWithLogitsLoss()
-    number_of_batches = len(train_dataloader)
-    # --------- train loop --------------------
-    for epoch in trange(
-        start_epoch, args.epoch_size, initial=start_epoch, desc="Current epoch"
-    ):
-        test_accuracy_list = []
-        for batch, (real_images, real_labels) in enumerate(
-            tqdm(train_dataloader, desc="Current batch")
+    try:
+        loss_fn = nn.BCEWithLogitsLoss()
+        number_of_batches = len(train_dataloader)
+        # --------- train loop --------------------
+        for epoch in trange(
+            start_epoch,
+            args.epoch_size + start_epoch,
+            initial=start_epoch,
+            desc="Current epoch",
         ):
-            real_images = real_images.to(args.device)
-            real_labels = real_labels.to(args.device)
+            train_d_loss_list = []
+            train_g_loss_list = []
+            test_accuracy_list = []
+            for batch, (real_images, real_labels) in enumerate(
+                tqdm(train_dataloader, leave=False, desc="Current batch")
+            ):
+                real_images = real_images.to(args.device)
+                real_labels = real_labels.to(args.device)
 
-            batch_size = real_images.shape[0]
+                batch_size = real_images.shape[0]
 
-            real = torch.randn(
-                (batch_size, 1), requires_grad=False, device=args.device
-            )
-            fake = torch.randn(
-                (batch_size, 1), requires_grad=False, device=args.device
-            )
+                real = torch.ones(
+                    (batch_size, 1),
+                    requires_grad=False,
+                    device=args.device,
+                    dtype=torch.float32,
+                )
+                fake = torch.zeros(
+                    (batch_size, 1),
+                    requires_grad=False,
+                    device=args.device,
+                    dtype=torch.float32,
+                )
 
-            generator.train()
+                generator.train()
 
-            # -----------------
-            #  Train Discriminator
-            # -----------------
+                # -----------------
+                #  Train Discriminator
+                # -----------------
 
-            discriminator_optimizer.zero_grad()
+                discriminator_optimizer.zero_grad()
 
-            # train with real images
-            real_or_fake, pred_labels = discriminator(real_images)
-            adversarial_loss = loss_fn(real_or_fake, real)
-            auxiliary_loss = loss_fn(pred_labels, real_labels)
+                z, sampled_labels = sample_noises(args, batch_size)
 
-            d_real_loss = adversarial_loss + auxiliary_loss
+                fake_images = generator(z, sampled_labels.detach())
 
-            # train with fake images
-            # sample noises z
-            z = torch.randn(
-                (batch_size, args.z_dim, 1, 1),
-                requires_grad=False,
-                device=args.device,
-            )
+                # train with real images
+                real_or_fake, pred_labels = discriminator(real_images)
+                d_real_adversarial_loss = loss_fn(real_or_fake, real)
+                d_real_auxiliary_loss = loss_fn(pred_labels, real_labels)
 
-            # sample one-hot labels c
-            sampled_labels = torch.randint(
-                low=0,
-                high=24,
-                size=(batch_size, args.max_objects),
-                requires_grad=False,
-                device=args.device,
-            )
-            sampled_labels = torch.sum(
-                F.one_hot(sampled_labels, num_classes=24), dim=1
-            ).float()
+                d_real_loss = d_real_adversarial_loss + d_real_auxiliary_loss
 
-            fake_images = generator(
-                z, sampled_labels.unsqueeze(-1).unsqueeze(-1)
-            )
+                # train with fake images
+                real_or_fake, pred_labels = discriminator(fake_images.detach())
+                d_fake_adversarial_loss = loss_fn(real_or_fake, fake)
+                d_fake_auxiliary_loss = loss_fn(pred_labels, sampled_labels)
 
-            real_or_fake, pred_labels = discriminator(fake_images.detach())
-            adversarial_loss = loss_fn(real_or_fake, fake)
-            auxiliary_loss = loss_fn(pred_labels, sampled_labels)
+                d_fake_loss = d_fake_adversarial_loss + d_fake_auxiliary_loss
 
-            d_fake_loss = adversarial_loss + auxiliary_loss
+                d_loss = d_real_loss + d_fake_loss
+                d_loss.backward()
+                discriminator_optimizer.step()
 
-            d_total_loss = d_real_loss + d_fake_loss
-            d_total_loss.backward()
-            discriminator_optimizer.step()
+                # -----------------
+                #  Train Generator
+                # -----------------
 
-            # -----------------
-            #  Train Generator
-            # -----------------
+                generator_optimizer.zero_grad()
 
-            generator_optimizer.zero_grad()
+                real_or_fake, pred_labels = discriminator(fake_images)
+                g_adversarial_loss = loss_fn(real_or_fake, real)
+                g_auxiliary_loss = loss_fn(pred_labels, sampled_labels)
 
-            real_or_fake, pred_labels = discriminator(fake_images)
-            adversarial_loss = loss_fn(real_or_fake, real)
-            auxiliary_loss = loss_fn(pred_labels, sampled_labels)
+                g_loss = g_adversarial_loss + g_auxiliary_loss
+                g_loss.backward()
+                generator_optimizer.step()
 
-            g_loss = adversarial_loss + auxiliary_loss
-            g_loss.backward()
-            generator_optimizer.step()
+                # -----------------
+                #  Evaluate batches
+                # -----------------
+                # test
+                test_accuracy, generated_images = evaluate(
+                    args, generator, test_dataloader
+                )
+                train_d_loss_list.append(d_loss.item())
+                train_g_loss_list.append(g_loss.item())
+                test_accuracy_list.append(test_accuracy)
+                save_images(
+                    f"{test_images_dir}/epoch={epoch}-batch={batch}.jpg",
+                    generated_images,
+                )
 
-            # -----------------
-            #  Evaluate batches
-            # -----------------
-            test_accuracy, generated_images = evaluate(
-                args, generator, test_dataloader
-            )
-            test_accuracy_list.append(test_accuracy)
-            save_images(
-                f"{test_images_dir}/epoch={epoch}-batch={batch}.jpg",
-                generated_images,
-            )
+                # test_accuracy, generated_images = evaluate(
+                #     args, generator, test_dataloader
+                # )
+                # save_images(
+                #     f"{test_images_dir}/epoch={epoch}-batch={batch}.jpg",
+                #     generated_images,
+                # )
+
+                with open(train_record_path, "a") as train_record:
+                    train_record.write(
+                        (
+                            "[Epoch %d/%d] [Batch %d/%d] [D loss: %.4f, real loss: %.4f, fake loss: %.4f] [Test accuracy: %.4f%%]\n"
+                            % (
+                                epoch,
+                                args.epoch_size,
+                                batch,
+                                number_of_batches,
+                                d_loss.item(),
+                                d_real_loss.item(),
+                                d_fake_loss.item(),
+                                test_accuracy * 100,
+                            )
+                        )
+                    )
+                    train_record.write(
+                        (
+                            "[Epoch %d/%d] [Batch %d/%d] [G loss: %.4f, real/fake loss: %.4f, classifier loss: %.4f]\n"
+                            % (
+                                epoch,
+                                args.epoch_size,
+                                batch,
+                                number_of_batches,
+                                g_loss.item(),
+                                g_adversarial_loss.item(),
+                                g_auxiliary_loss.item(),
+                            )
+                        )
+                    )
+
+            train_d_loss = np.array(train_d_loss_list).mean()
+            train_g_loss = np.array(train_g_loss_list).mean()
+            test_accuracy = np.array(test_accuracy_list).mean()
+
+            metrics["train_d_loss"].append(train_d_loss)
+            metrics["train_g_loss"].append(train_g_loss)
+            metrics["test_accuracy"].append(test_accuracy)
 
             with open(train_record_path, "a") as train_record:
                 train_record.write(
                     (
-                        "[Epoch %d/%d] [Batch %d/%d] [D loss: %.4f] [G loss: %.4f] [Test accuracy: %.4f]\n"
+                        "[Epoch %d/%d] [D loss: %.4f] [G loss: %.4f] [Test accuracy: %.4f%%]\n"
                         % (
                             epoch,
                             args.epoch_size,
-                            batch,
-                            number_of_batches,
-                            d_total_loss.item(),
-                            g_loss.item(),
-                            test_accuracy,
+                            train_d_loss,
+                            train_g_loss,
+                            test_accuracy * 100,
                         )
                     )
                 )
 
-        test_accuracy = np.array(test_accuracy_list).mean()
-        metrics["test_accuracy"].append(test_accuracy)
-
-        with open(train_record_path, "a") as train_record:
-            train_record.write(
-                (
-                    "[Epoch %d/%d] [Average test accuracy: %.4f]\n"
-                    % (
-                        epoch,
-                        args.epoch_size,
-                        test_accuracy,
-                    )
+            if test_accuracy > best_test_accuracy:
+                best_test_accuracy = test_accuracy
+                save_model(
+                    f"{args.log_dir}/best_model.pth",
+                    epoch,
+                    generator,
+                    discriminator,
+                    args,
+                    metrics,
                 )
-            )
 
-        if test_accuracy > best_test_accuracy:
-            best_test_accuracy = test_accuracy
-            save_model(
-                args.log_dir,
-                epoch,
-                generator,
-                discriminator,
-                args,
-                metrics,
-            )
-
-        if args.save_model_for_every_epoch:
-            save_model(
-                models_dir, epoch, generator, discriminator, args, metrics
-            )
+            if args.save_model_for_every_epoch:
+                save_model(
+                    f"{models_dir}/{epoch}.pth",
+                    epoch,
+                    generator,
+                    discriminator,
+                    args,
+                    metrics,
+                )
+    finally:
+        show_curves(args.log_dir, metrics)
 
 
 if __name__ == "__main__":

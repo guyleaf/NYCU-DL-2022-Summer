@@ -86,6 +86,5 @@ class CLEVRDataset(Dataset):
 
 
 if __name__ == "__main__":
-    np.random.seed(1234)
     data = CLEVRDataset("./data", mode="train")
     print("Data samples: ", len(data))

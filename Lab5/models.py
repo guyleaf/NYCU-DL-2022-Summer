@@ -5,8 +5,15 @@ ngf = ndf = 64
 
 
 class Generator(nn.Module):
+    _in_channels: int
+
     def __init__(self, in_channels: int, out_channels: int):
         super(Generator, self).__init__()
+
+        self._in_channels = in_channels
+
+        # self.embedding = nn.Linear(in_channels, ngf * 8 * 4 * 4)
+        # self.projection = nn.Linear(in_channels, ngf * 8 * 4 * 4)
 
         def conv_block(
             in_channels: int,
@@ -30,7 +37,8 @@ class Generator(nn.Module):
             ]
 
         self.main = nn.Sequential(
-            # input is Z, going into a convolution
+            # nn.BatchNorm2d(ngf * 8),
+            # # input is Z, going into a convolution
             *conv_block(in_channels, ngf * 8, 4, 1, 0),
             # state size. (ngf*8) x 4 x 4
             *conv_block(ngf * 8, ngf * 4, 4, 2, 1),
@@ -45,7 +53,10 @@ class Generator(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, c: torch.Tensor):
-        return self.main(torch.concat((x, c), dim=1))
+        latent = torch.concat((x, c), dim=1)
+        # latent = self.projection(latent)
+        latent = latent.view(-1, self._in_channels, 1, 1)
+        return self.main(latent)
 
 
 class Discriminator(nn.Module):
@@ -69,7 +80,9 @@ class Discriminator(nn.Module):
                     stride,
                     padding,
                     bias=bias,
-                )
+                ),
+                # nn.LeakyReLU(0.2, inplace=True),
+                # nn.Dropout2d(0.25),
             ]
             if normalization:
                 layers.append(nn.BatchNorm2d(out_channels))
@@ -87,16 +100,23 @@ class Discriminator(nn.Module):
             *conv_block(ndf * 4, ndf * 8, 4, 2, 1)
         )
 
+        # in_features = ndf * 8 * 4 * 4
         # output networks
         # state size. (ndf*8) x 4 x 4
         self.adversarial_network = nn.Sequential(
-            nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False), nn.Flatten()
+            nn.Conv2d(ndf * 8, 1, 4, 1, 0), nn.Flatten()
         )
+        # self.adversarial_network = nn.Sequential(
+        #     nn.Flatten(), nn.Linear(in_features, 1)
+        # )
 
         # state size. (ndf*8) x 4 x 4
         self.labels_classifier = nn.Sequential(
-            nn.Conv2d(ndf * 8, n_classes, 4, 1, 0, bias=False), nn.Flatten()
+            nn.Conv2d(ndf * 8, n_classes, 4, 1, 0), nn.Flatten()
         )
+        # self.labels_classifier = nn.Sequential(
+        #     nn.Flatten(), nn.Linear(in_features, n_classes)
+        # )
 
     def forward(self, x: torch.Tensor):
         output = self.convs(x)
