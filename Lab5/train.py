@@ -14,7 +14,13 @@ from tqdm import tqdm, trange
 from datasets import CLEVRDataset
 from evaluator import EvaluationModel
 from models import Discriminator, Generator
-from utils import save_images, set_seeds, show_curves, weights_init
+from utils import (
+    calculate_accuracy_of_classifier,
+    save_images,
+    set_seeds,
+    show_curves,
+    weights_init,
+)
 
 
 class ArgumentParser(Tap):
@@ -24,6 +30,7 @@ class ArgumentParser(Tap):
     epoch_size: int = 100  # number of epochs to train for
     momentum: float = 0.5  # momentum of Adam optimizer
     z_dim: int = 100  # dimensionality of z noise
+    label_smoothing_ratio: float = 0  # the ratio for label smoothing
     model_file: str = ""  # path of model file
     save_model_for_every_epoch: bool = False
     data_dir: str = "./data"  # path of data folder
@@ -69,17 +76,26 @@ def sample_noises(args: ArgumentParser, batch_size: int):
     # sample one-hot labels c
     # use multinomial to avoid generating duplicated labels
     # discussion: https://discuss.pytorch.org/t/how-to-generate-non-overlap-random-integer-tuple-efficiently/40869/4
-    weights = torch.ones(24, requires_grad=False, device=args.device).expand(
-        batch_size, -1
+    numbers_of_objects = torch.randint(
+        1, args.max_objects + 1, size=(batch_size,)
     )
-    sampled_labels = torch.multinomial(
-        weights, num_samples=args.max_objects, replacement=False
-    )
-    sampled_labels = torch.sum(
-        F.one_hot(sampled_labels, num_classes=24), dim=1, dtype=torch.float32
-    )
+    # uniformly select
+    weights = torch.ones(24)
 
-    return z, sampled_labels
+    sampled_labels = []
+    for number_of_objects in numbers_of_objects:
+        sampled_indices = torch.multinomial(
+            weights, num_samples=number_of_objects, replacement=False
+        )
+        sampled_label = torch.sum(
+            F.one_hot(sampled_indices, num_classes=24),
+            dim=0,
+            dtype=torch.float32,
+        )
+        sampled_labels.append(sampled_label)
+    sampled_labels = torch.stack(sampled_labels, dim=0).to(args.device)
+
+    return (z, sampled_labels)
 
 
 @torch.no_grad()
@@ -115,6 +131,7 @@ def main():
     assert args.device == "cpu" or (
         args.device == "cuda" and torch.cuda.is_available()
     )
+    assert 0 <= args.label_smoothing_ratio and args.label_smoothing_ratio <= 1
 
     if args.model_file != "":
         # load model and continue training from checkpoint
@@ -153,7 +170,12 @@ def main():
 
         args.log_dir = f"{args.log_dir}/{name}"
         start_epoch = 0
-        metrics = {"train_d_loss": [], "train_g_loss": [], "test_accuracy": []}
+        metrics = {
+            "train_d_loss": [],
+            "train_g_loss": [],
+            "train_d_label_accuracy": [],
+            "test_accuracy": [],
+        }
         best_test_accuracy = 0
 
     print("Random seed:", args.seed)
@@ -225,10 +247,10 @@ def main():
         lr=args.generator_lr,
         betas=(args.momentum, 0.999),
     )
-    discriminator_optimizer = optim.SGD(
+    discriminator_optimizer = optim.Adam(
         discriminator.parameters(),
         lr=args.discriminator_lr,
-        momentum=args.momentum,
+        betas=(args.momentum, 0.999),
     )
 
     try:
@@ -237,12 +259,14 @@ def main():
         # --------- train loop --------------------
         for epoch in trange(
             start_epoch,
-            args.epoch_size + start_epoch,
+            args.epoch_size,
             initial=start_epoch,
+            total=args.epoch_size,
             desc="Current epoch",
         ):
             train_d_loss_list = []
             train_g_loss_list = []
+            train_d_label_accuracy_list = []
             test_accuracy_list = []
             for batch, (real_images, real_labels) in enumerate(
                 tqdm(train_dataloader, leave=False, desc="Current batch")
@@ -275,19 +299,25 @@ def main():
 
                 z, sampled_labels = sample_noises(args, batch_size)
 
-                fake_images = generator(z, sampled_labels.detach())
+                fake_images = generator(z, sampled_labels)
 
                 # train with real images
-                real_or_fake, pred_labels = discriminator(real_images)
-                d_real_adversarial_loss = loss_fn(real_or_fake, real)
-                d_real_auxiliary_loss = loss_fn(pred_labels, real_labels)
+                real_or_fake, pred_real_labels = discriminator(real_images)
+                d_real_adversarial_loss = loss_fn(
+                    real_or_fake, real - args.label_smoothing_ratio
+                )
+                d_real_auxiliary_loss = loss_fn(pred_real_labels, real_labels)
 
                 d_real_loss = d_real_adversarial_loss + d_real_auxiliary_loss
 
                 # train with fake images
-                real_or_fake, pred_labels = discriminator(fake_images.detach())
+                real_or_fake, pred_sampled_labels = discriminator(
+                    fake_images.detach()
+                )
                 d_fake_adversarial_loss = loss_fn(real_or_fake, fake)
-                d_fake_auxiliary_loss = loss_fn(pred_labels, sampled_labels)
+                d_fake_auxiliary_loss = loss_fn(
+                    pred_sampled_labels, sampled_labels
+                )
 
                 d_fake_loss = d_fake_adversarial_loss + d_fake_auxiliary_loss
 
@@ -312,7 +342,28 @@ def main():
                 # -----------------
                 #  Evaluate batches
                 # -----------------
-                # test
+
+                # calculate label accuracy
+                pred = torch.concat(
+                    [
+                        pred_real_labels.detach().cpu(),
+                        pred_sampled_labels.detach().cpu(),
+                    ],
+                    dim=0,
+                )
+                gt = torch.concat(
+                    [
+                        real_labels.detach().cpu(),
+                        sampled_labels.detach().cpu(),
+                    ],
+                    dim=0,
+                )
+                train_d_label_accuracy = calculate_accuracy_of_classifier(
+                    pred, gt
+                )
+                train_d_label_accuracy_list.append(train_d_label_accuracy)
+
+                # evaluator
                 test_accuracy, generated_images = evaluate(
                     args, generator, test_dataloader
                 )
@@ -335,7 +386,7 @@ def main():
                 with open(train_record_path, "a") as train_record:
                     train_record.write(
                         (
-                            "[Epoch %d/%d] [Batch %d/%d] [D loss: %.4f, real loss: %.4f, fake loss: %.4f] [Test accuracy: %.4f%%]\n"
+                            "[Epoch %d/%d] [Batch %d/%d] [D loss: %.4f, real loss: %.4f, fake loss: %.4f]\n"
                             % (
                                 epoch,
                                 args.epoch_size,
@@ -344,7 +395,6 @@ def main():
                                 d_loss.item(),
                                 d_real_loss.item(),
                                 d_fake_loss.item(),
-                                test_accuracy * 100,
                             )
                         )
                     )
@@ -362,24 +412,42 @@ def main():
                             )
                         )
                     )
+                    train_record.write(
+                        (
+                            "[Epoch %d/%d] [Batch %d/%d] [D classifier accuracy: %.4f%%] [Eval accuracy: %.4f%%]\n"
+                            % (
+                                epoch,
+                                args.epoch_size,
+                                batch,
+                                number_of_batches,
+                                train_d_label_accuracy * 100,
+                                test_accuracy * 100,
+                            )
+                        )
+                    )
 
             train_d_loss = np.array(train_d_loss_list).mean()
             train_g_loss = np.array(train_g_loss_list).mean()
+            train_d_label_accuracy = np.array(
+                train_d_label_accuracy_list
+            ).mean()
             test_accuracy = np.array(test_accuracy_list).mean()
 
             metrics["train_d_loss"].append(train_d_loss)
             metrics["train_g_loss"].append(train_g_loss)
+            metrics["train_d_label_accuracy"].append(train_d_label_accuracy)
             metrics["test_accuracy"].append(test_accuracy)
 
             with open(train_record_path, "a") as train_record:
                 train_record.write(
                     (
-                        "[Epoch %d/%d] [D loss: %.4f] [G loss: %.4f] [Test accuracy: %.4f%%]\n"
+                        "[Epoch %d/%d] [D loss: %.4f] [G loss: %.4f] [D classifier accuracy: %.4f%%] [Eval accuracy: %.4f%%]\n"
                         % (
                             epoch,
                             args.epoch_size,
                             train_d_loss,
                             train_g_loss,
+                            train_d_label_accuracy * 100,
                             test_accuracy * 100,
                         )
                     )

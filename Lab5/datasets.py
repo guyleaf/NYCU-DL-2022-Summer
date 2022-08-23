@@ -12,6 +12,7 @@ from utils import read_json
 
 DEFAULT_TRANSFORMS = transforms.Compose(
     [
+        # transforms.RandomCrop(240),
         transforms.Resize((64, 64)),
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),

@@ -22,6 +22,23 @@ def save_images(path: str, images: torch.Tensor):
     save_image(grid, path)
 
 
+def calculate_accuracy_of_classifier(
+    pred: torch.Tensor, gt: torch.Tensor
+) -> float:
+    batch_size = pred.size(0)
+    acc = 0
+    total = 0
+    for i in range(batch_size):
+        k = int(gt[i].sum().item())
+        total += k
+        outv, outi = pred[i].topk(k)
+        lv, li = gt[i].topk(k)
+        for j in outi:
+            if j in li:
+                acc += 1
+    return acc / total
+
+
 def show_curves(saved_path: str, metrics: Dict[str, List[float]]):
     epochs = list(range(len(metrics["train_d_loss"])))
     _, ax1 = plt.subplots()
