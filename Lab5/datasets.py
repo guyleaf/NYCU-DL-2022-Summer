@@ -13,7 +13,8 @@ from utils import read_json
 DEFAULT_TRANSFORMS = transforms.Compose(
     [
         # transforms.RandomCrop(240),
-        transforms.Resize((64, 64)),
+        transforms.Resize(64),
+        transforms.CenterCrop(64),
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
     ]
@@ -66,6 +67,9 @@ class CLEVRDataset(Dataset):
                 )
             )
         self._labels = np.array(one_hot_vectors)
+
+    def get_n_classes(self):
+        return self._labels.shape[1]
 
     def _get_image(self, index: int) -> torch.Tensor:
         image_name = self._images[index]

@@ -65,7 +65,7 @@ def save_model(
     )
 
 
-def sample_noises(args: ArgumentParser, batch_size: int):
+def sample_noises(args: ArgumentParser, batch_size: int, n_classes: int):
     # sample noises z
     z = torch.randn(
         (batch_size, args.z_dim),
@@ -80,7 +80,7 @@ def sample_noises(args: ArgumentParser, batch_size: int):
         1, args.max_objects + 1, size=(batch_size,)
     )
     # uniformly select
-    weights = torch.ones(24)
+    weights = torch.ones(n_classes)
 
     sampled_labels = []
     for number_of_objects in numbers_of_objects:
@@ -88,7 +88,7 @@ def sample_noises(args: ArgumentParser, batch_size: int):
             weights, num_samples=number_of_objects, replacement=False
         )
         sampled_label = torch.sum(
-            F.one_hot(sampled_indices, num_classes=24),
+            F.one_hot(sampled_indices, num_classes=n_classes),
             dim=0,
             dtype=torch.float32,
         )
@@ -103,6 +103,7 @@ def evaluate(
     args: ArgumentParser,
     generator: nn.Module,
     test_dataloader: DataLoader,
+    n_classes: int,
 ) -> Tuple[float, torch.Tensor]:
     evaluator = EvaluationModel()
 
@@ -115,7 +116,7 @@ def evaluate(
         batch_size = labels.shape[0]
 
         # sample noises z
-        z, _ = sample_noises(args, batch_size)
+        z, _ = sample_noises(args, batch_size, n_classes)
 
         sampled_images = generator(z, labels)
         total_accuracy += evaluator.eval(sampled_images, labels)
@@ -229,8 +230,9 @@ def main():
     # print("New Test data samples: ", len(new_test_data))
 
     # --------- build models ------------------
-    generator = Generator(args.z_dim + 24, 3)
-    discriminator = Discriminator(3, 24)
+    n_classes = train_data.get_n_classes()
+    generator = Generator(n_classes, args.z_dim, 3)
+    discriminator = Discriminator(3, n_classes)
     if args.model_file != "":
         generator.load_state_dict(networks["generator"])
         discriminator.load_state_dict(networks["discriminator"])
@@ -297,7 +299,7 @@ def main():
 
                 discriminator_optimizer.zero_grad()
 
-                z, sampled_labels = sample_noises(args, batch_size)
+                z, sampled_labels = sample_noises(args, batch_size, n_classes)
 
                 fake_images = generator(z, sampled_labels)
 
@@ -309,6 +311,7 @@ def main():
                 d_real_auxiliary_loss = loss_fn(pred_real_labels, real_labels)
 
                 d_real_loss = d_real_adversarial_loss + d_real_auxiliary_loss
+                d_real_loss.backward()
 
                 # train with fake images
                 real_or_fake, pred_sampled_labels = discriminator(
@@ -320,9 +323,10 @@ def main():
                 )
 
                 d_fake_loss = d_fake_adversarial_loss + d_fake_auxiliary_loss
+                d_fake_loss.backward()
 
                 d_loss = d_real_loss + d_fake_loss
-                d_loss.backward()
+                # d_loss.backward()
                 discriminator_optimizer.step()
 
                 # -----------------
@@ -334,8 +338,8 @@ def main():
                 real_or_fake, pred_labels = discriminator(fake_images)
                 g_adversarial_loss = loss_fn(real_or_fake, real)
                 g_auxiliary_loss = loss_fn(pred_labels, sampled_labels)
-
                 g_loss = g_adversarial_loss + g_auxiliary_loss
+
                 g_loss.backward()
                 generator_optimizer.step()
 
@@ -365,7 +369,7 @@ def main():
 
                 # evaluator
                 test_accuracy, generated_images = evaluate(
-                    args, generator, test_dataloader
+                    args, generator, test_dataloader, n_classes
                 )
                 train_d_loss_list.append(d_loss.item())
                 train_g_loss_list.append(g_loss.item())

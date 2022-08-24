@@ -38,14 +38,13 @@ class Generator(nn.Module):
             # state size. n_classes x 1 x 1
             *conv_block(n_classes, 16, 4, 1, 0),
             # state size. 16 x 4 x 4
-            *conv_block(n_classes, 4, 4, 2, 1),
+            *conv_block(16, 4, 4, 2, 1),
             # state size. 4 x 8 x 8
-            *conv_block(n_classes, 1, 4, 2, 1),
+            *conv_block(4, 1, 4, 2, 1),
             # state size. 1 x 16 x 16
             nn.Flatten(),
             nn.Linear(in_features=16 * 16, out_features=z_dim, bias=False),
             nn.ReLU(inplace=True),
-            nn.BatchNorm1d(z_dim),
         )
 
         self.main = nn.Sequential(
@@ -94,12 +93,12 @@ class Discriminator(nn.Module):
                     padding,
                     bias=bias,
                 ),
-                # nn.LeakyReLU(0.2, inplace=True),
-                # nn.Dropout2d(0.25),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Dropout2d(0.5),
             ]
             if normalization:
                 layers.append(nn.BatchNorm2d(out_channels))
-            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            # layers.append(nn.LeakyReLU(0.2, inplace=True))
             return layers
 
         self.convs = nn.Sequential(
