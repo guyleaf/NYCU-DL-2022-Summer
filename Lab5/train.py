@@ -24,7 +24,7 @@ from utils import (
 
 
 class ArgumentParser(Tap):
-    network_type: str = Literal["acgan+aux", "acgan+proj"]
+    network_type: Literal["acgan+aux", "acgan+proj"] = "acgan+aux"
     generator_lr: float = 2e-4  # learning rate for generator
     discriminator_lr: float = 2e-4  # learning rate for discriminator
     batch_size: int = 64  # batch size
@@ -82,19 +82,20 @@ def sample_noises(args: ArgumentParser, batch_size: int, n_classes: int):
     )
     # uniformly sampled
     weights = torch.ones(n_classes)
-    sampled_indices = torch.multinomial(
-        weights, num_samples=torch.sum(numbers_of_objects), replacement=False
+    indices = torch.multinomial(
+        weights, num_samples=torch.sum(numbers_of_objects), replacement=True
     )
 
     sampled_labels = []
-    sampled_groups = torch.split(sampled_indices, numbers_of_objects.tolist())
-    for sampled_group in sampled_groups:
-        sampled_label = torch.sum(
-            F.one_hot(sampled_group, num_classes=n_classes),
+    groups = torch.split(indices, numbers_of_objects.tolist())
+    for group in groups:
+        label = torch.sum(
+            F.one_hot(group, num_classes=n_classes),
             dim=0,
             dtype=torch.float32,
         )
-        sampled_labels.append(sampled_label)
+        label = label.clamp_max(1)
+        sampled_labels.append(label)
     sampled_labels = torch.stack(sampled_labels, dim=0).to(args.device)
 
     return (z, sampled_labels)
