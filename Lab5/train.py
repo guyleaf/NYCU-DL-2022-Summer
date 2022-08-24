@@ -80,16 +80,17 @@ def sample_noises(args: ArgumentParser, batch_size: int, n_classes: int):
     numbers_of_objects = torch.randint(
         1, args.max_objects + 1, size=(batch_size,)
     )
-    # uniformly select
+    # uniformly sampled
     weights = torch.ones(n_classes)
+    sampled_indices = torch.multinomial(
+        weights, num_samples=torch.sum(numbers_of_objects), replacement=False
+    )
 
     sampled_labels = []
-    for number_of_objects in numbers_of_objects:
-        sampled_indices = torch.multinomial(
-            weights, num_samples=number_of_objects, replacement=False
-        )
+    sampled_groups = torch.split(sampled_indices, numbers_of_objects.tolist())
+    for sampled_group in sampled_groups:
         sampled_label = torch.sum(
-            F.one_hot(sampled_indices, num_classes=n_classes),
+            F.one_hot(sampled_group, num_classes=n_classes),
             dim=0,
             dtype=torch.float32,
         )

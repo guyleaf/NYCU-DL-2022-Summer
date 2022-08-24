@@ -20,8 +20,9 @@ class Generator(nn.Module):
             stride: int,
             padding: int,
             bias: bool = False,
+            normalization: bool = True,
         ):
-            return [
+            layers = [
                 nn.ConvTranspose2d(
                     in_channels,
                     out_channels,
@@ -30,28 +31,24 @@ class Generator(nn.Module):
                     padding,
                     bias=bias,
                 ),
-                nn.BatchNorm2d(out_channels),
-                nn.LeakyReLU(0.2, inplace=True),
             ]
+            if normalization:
+                layers.append(nn.BatchNorm2d(out_channels))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            return layers
 
-        self.projection = nn.Sequential(
-            # state size. n_classes x 1 x 1
-            *conv_block(n_classes, 16, 4, 1, 0),
-            # state size. 16 x 4 x 4
-            *conv_block(16, 4, 4, 2, 1),
-            # state size. 4 x 8 x 8
-            *conv_block(4, 1, 4, 2, 1),
-            # state size. 1 x 16 x 16
-            nn.Flatten(),
-            nn.Linear(in_features=16 * 16, out_features=z_dim, bias=False),
-            nn.ReLU(inplace=True),
+        # state size. n_classes x 1
+        self.embedding = nn.ConvTranspose2d(
+            n_classes, n_classes, 4, 1, 0, bias=False, groups=n_classes
         )
+        # state size. n_classes x 4 x 4
 
+        self.l1 = nn.Sequential(
+            *conv_block(z_dim, ngf * 8, 4, 1, 0, normalization=False)
+        )
         self.main = nn.Sequential(
-            # input is Z, going into a convolution
-            *conv_block(z_dim * 2, ngf * 8, 4, 1, 0),
             # state size. (ngf*8) x 4 x 4
-            *conv_block(ngf * 8, ngf * 4, 4, 2, 1),
+            *conv_block(ngf * 8 + n_classes, ngf * 4, 4, 2, 1),
             # state size. (ngf*4) x 8 x 8
             *conv_block(ngf * 4, ngf * 2, 4, 2, 1),
             # state size. (ngf*2) x 16 x 16
@@ -63,12 +60,12 @@ class Generator(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, label: torch.Tensor):
+        x = x.view(-1, self._z_dim, 1, 1)
         label = label.view(-1, self._n_classes, 1, 1)
-        condition = self.projection(label)
-        latent = torch.concat((x, condition), dim=1)
-        latent = latent.view(-1, self._z_dim * 2, 1, 1)
 
-        return self.main(latent)
+        x = self.l1(x)
+        condition = self.embedding(label)
+        return self.main(torch.concat((x, condition), dim=1))
 
 
 class Discriminator(nn.Module):
