@@ -1,6 +1,6 @@
 ﻿import os
 from datetime import datetime
-from typing import Tuple
+from typing import Literal, Tuple
 
 import numpy as np
 import torch
@@ -24,6 +24,7 @@ from utils import (
 
 
 class ArgumentParser(Tap):
+    network_type: str = Literal["acgan+aux", "acgan+proj"]
     generator_lr: float = 2e-4  # learning rate for generator
     discriminator_lr: float = 2e-4  # learning rate for discriminator
     batch_size: int = 64  # batch size
@@ -232,7 +233,13 @@ def main():
     # --------- build models ------------------
     n_classes = train_data.get_n_classes()
     generator = Generator(n_classes, args.z_dim, 3)
-    discriminator = Discriminator(3, n_classes)
+    if args.network_type == "acgan+aux":
+        discriminator = Discriminator(3, n_classes)
+    else:
+        raise NotImplementedError(
+            f"The network type {args.network_type} is not implemented."
+        )
+
     if args.model_file != "":
         generator.load_state_dict(networks["generator"])
         discriminator.load_state_dict(networks["discriminator"])
@@ -304,29 +311,27 @@ def main():
                 fake_images = generator(z, sampled_labels)
 
                 # train with real images
-                real_or_fake, pred_real_labels = discriminator(real_images)
+                pred_real_validity, pred_real_labels = discriminator(
+                    real_images
+                )
                 d_real_adversarial_loss = loss_fn(
-                    real_or_fake, real - args.label_smoothing_ratio
+                    pred_real_validity, real - args.label_smoothing_ratio
                 )
                 d_real_auxiliary_loss = loss_fn(pred_real_labels, real_labels)
-
                 d_real_loss = d_real_adversarial_loss + d_real_auxiliary_loss
-                d_real_loss.backward()
 
                 # train with fake images
-                real_or_fake, pred_sampled_labels = discriminator(
+                pred_fake_validity, pred_sampled_labels = discriminator(
                     fake_images.detach()
                 )
-                d_fake_adversarial_loss = loss_fn(real_or_fake, fake)
+                d_fake_adversarial_loss = loss_fn(pred_fake_validity, fake)
                 d_fake_auxiliary_loss = loss_fn(
                     pred_sampled_labels, sampled_labels
                 )
-
                 d_fake_loss = d_fake_adversarial_loss + d_fake_auxiliary_loss
-                d_fake_loss.backward()
 
                 d_loss = d_real_loss + d_fake_loss
-                # d_loss.backward()
+                d_loss.backward()
                 discriminator_optimizer.step()
 
                 # -----------------
@@ -335,8 +340,8 @@ def main():
 
                 generator_optimizer.zero_grad()
 
-                real_or_fake, pred_labels = discriminator(fake_images)
-                g_adversarial_loss = loss_fn(real_or_fake, real)
+                pred_validity, pred_labels = discriminator(fake_images)
+                g_adversarial_loss = loss_fn(pred_validity, real)
                 g_auxiliary_loss = loss_fn(pred_labels, sampled_labels)
                 g_loss = g_adversarial_loss + g_auxiliary_loss
 
