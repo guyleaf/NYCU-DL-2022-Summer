@@ -56,13 +56,13 @@ class CLEVRDataset(Dataset):
 
         # convert objects to one-hot vector
         objects_map = read_json(root_path / "objects.json")
-        number_of_objects = len(objects_map.keys())
+        n_objects = len(objects_map.keys())
         one_hot_vectors = []
         for label in labels:
             label = [objects_map[key] for key in label]
             one_hot_vectors.append(
                 np.sum(
-                    np.eye(number_of_objects, dtype=np.int64)[label],
+                    np.eye(n_objects, dtype=np.int64)[label],
                     axis=0,
                 )
             )

@@ -4,11 +4,11 @@ import torch.nn as nn
 ngf = ndf = 64
 
 
-class Generator(nn.Module):
+class CGANGenerator(nn.Module):
     _in_channels: int
 
     def __init__(self, n_classes: int, z_dim: int, out_channels: int):
-        super(Generator, self).__init__()
+        super(CGANGenerator, self).__init__()
 
         self._z_dim = z_dim
         self._n_classes = n_classes
@@ -38,17 +38,22 @@ class Generator(nn.Module):
             return layers
 
         # state size. n_classes x 1
-        self.embedding = nn.ConvTranspose2d(
-            n_classes, n_classes, 4, 1, 0, bias=False, groups=n_classes
+        # like nn.Embedding but for multi-label task
+        self.embedding = nn.Sequential(
+            nn.ConvTranspose2d(
+                n_classes, n_classes, 4, 1, 0, bias=False, groups=n_classes
+            ),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Flatten(),
+            nn.Linear(n_classes * 4 * 4, z_dim, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
         )
         # state size. n_classes x 4 x 4
 
-        self.l1 = nn.Sequential(
-            *conv_block(z_dim, ngf * 8, 4, 1, 0, normalization=False)
-        )
         self.main = nn.Sequential(
+            *conv_block(z_dim * 2, ngf * 8, 4, 1, 0),
             # state size. (ngf*8) x 4 x 4
-            *conv_block(ngf * 8 + n_classes, ngf * 4, 4, 2, 1),
+            *conv_block(ngf * 8, ngf * 4, 4, 2, 1),
             # state size. (ngf*4) x 8 x 8
             *conv_block(ngf * 4, ngf * 2, 4, 2, 1),
             # state size. (ngf*2) x 16 x 16
@@ -63,14 +68,17 @@ class Generator(nn.Module):
         x = x.view(-1, self._z_dim, 1, 1)
         label = label.view(-1, self._n_classes, 1, 1)
 
-        x = self.l1(x)
-        condition = self.embedding(label)
+        condition = self.embedding(label).view(-1, self._z_dim, 1, 1)
         return self.main(torch.concat((x, condition), dim=1))
 
 
-class Discriminator(nn.Module):
+class CGANDiscriminator(nn.Module):
     def __init__(self, in_channels: int, n_classes: int):
-        super(Discriminator, self).__init__()
+        super(CGANDiscriminator, self).__init__()
+
+        self._image_size = 64
+        self._in_channels = in_channels
+        self._n_classes = n_classes
 
         def conv_block(
             in_channels: int,
@@ -90,17 +98,29 @@ class Discriminator(nn.Module):
                     padding,
                     bias=bias,
                 ),
-                nn.LeakyReLU(0.2, inplace=True),
-                nn.Dropout2d(0.5),
             ]
             if normalization:
                 layers.append(nn.BatchNorm2d(out_channels))
-            # layers.append(nn.LeakyReLU(0.2, inplace=True))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
             return layers
+
+        self.embedding = nn.Sequential(
+            nn.ConvTranspose2d(
+                n_classes, n_classes, 4, 1, 0, bias=False, groups=n_classes
+            ),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Flatten(),
+            nn.Linear(
+                n_classes * 4 * 4,
+                in_channels * self._image_size**2,
+                bias=False,
+            ),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
 
         self.convs = nn.Sequential(
             # input is (nc) x 64 x 64
-            *conv_block(in_channels, ndf, 4, 2, 1, normalization=False),
+            *conv_block(in_channels * 2, ndf, 4, 2, 1, normalization=False),
             # state size. (ndf) x 32 x 32
             *conv_block(ndf, ndf * 2, 4, 2, 1),
             # state size. (ndf*2) x 16 x 16
@@ -109,26 +129,18 @@ class Discriminator(nn.Module):
             *conv_block(ndf * 4, ndf * 8, 4, 2, 1),
         )
 
-        # in_features = ndf * 8 * 4 * 4
         # output networks
         # state size. (ndf*8) x 4 x 4
         self.adversarial_network = nn.Sequential(
             nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False), nn.Flatten()
         )
-        # self.adversarial_network = nn.Sequential(
-        #     nn.Flatten(), nn.Linear(in_features, 1)
-        # )
 
-        # state size. (ndf*8) x 4 x 4
-        self.labels_classifier = nn.Sequential(
-            nn.Conv2d(ndf * 8, n_classes, 4, 1, 0, bias=False), nn.Flatten()
+    def forward(self, x: torch.Tensor, label: torch.Tensor):
+        label = label.view(-1, self._n_classes, 1, 1)
+
+        condition = self.embedding(label).view(
+            -1, self._in_channels, self._image_size, self._image_size
         )
-        # self.labels_classifier = nn.Sequential(
-        #     nn.Flatten(), nn.Linear(in_features, n_classes)
-        # )
-
-    def forward(self, x: torch.Tensor):
-        output = self.convs(x)
+        output = self.convs(torch.concat([x, condition], dim=1))
         real_or_fake = self.adversarial_network(output)
-        labels = self.labels_classifier(output)
-        return real_or_fake, labels
+        return real_or_fake

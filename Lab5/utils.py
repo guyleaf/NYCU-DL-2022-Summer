@@ -4,7 +4,51 @@ from typing import Dict, List
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torchvision.utils import make_grid, save_image
+
+
+def sample_labels(
+    max_objects: int, batch_size: int, n_classes: int, device: str = "cuda"
+):
+    """use multinomial to avoid generating duplicated labels
+    discussion: https://discuss.pytorch.org/t/how-to-generate-non-overlap-random-integer-tuple-efficiently/40869/4
+    """
+    numbers_of_objects = torch.randint(1, max_objects + 1, size=(batch_size,))
+    # uniformly sampled
+    weights = torch.ones(n_classes)
+    indices = torch.multinomial(
+        weights, num_samples=torch.sum(numbers_of_objects), replacement=True
+    )
+
+    sampled_labels = []
+    groups = torch.split(indices, numbers_of_objects.tolist())
+    for group in groups:
+        label = torch.sum(
+            F.one_hot(group, num_classes=n_classes),
+            dim=0,
+            dtype=torch.float32,
+        )
+        label = label.clamp_max(1)
+        sampled_labels.append(label)
+    return torch.stack(sampled_labels, dim=0).to(device)
+
+
+def sample_z(z_dim: int, batch_size: int, device: str = "cuda"):
+    return torch.randn((batch_size, z_dim), requires_grad=False, device=device)
+
+
+def sample_noises(
+    z_dim: int,
+    batch_size: int,
+    n_classes: int,
+    max_objects: int = 3,
+    device: str = "cuda",
+):
+    # sample noises z
+    z = sample_z(z_dim, batch_size, device)
+    labels = sample_labels(max_objects, batch_size, n_classes, device)
+    return (z, labels)
 
 
 def read_json(path):
