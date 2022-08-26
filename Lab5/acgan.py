@@ -34,7 +34,7 @@ class ACGANGenerator(nn.Module):
             ]
             if normalization:
                 layers.append(nn.BatchNorm2d(out_channels))
-            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            layers.append(nn.ReLU(inplace=True))
             return layers
 
         # state size. n_classes x 1

@@ -34,21 +34,19 @@ class CGANGenerator(nn.Module):
             ]
             if normalization:
                 layers.append(nn.BatchNorm2d(out_channels))
-            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            layers.append(nn.LeakyReLU(inplace=True))
             return layers
 
-        # state size. n_classes x 1
         # like nn.Embedding but for multi-label task
         self.embedding = nn.Sequential(
             nn.ConvTranspose2d(
                 n_classes, n_classes, 4, 1, 0, bias=False, groups=n_classes
             ),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.Flatten(),
             nn.Linear(n_classes * 4 * 4, z_dim, bias=False),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.LeakyReLU(inplace=True),
         )
-        # state size. n_classes x 4 x 4
 
         self.main = nn.Sequential(
             *conv_block(z_dim * 2, ngf * 8, 4, 1, 0),
@@ -98,10 +96,12 @@ class CGANDiscriminator(nn.Module):
                     padding,
                     bias=bias,
                 ),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Dropout2d(0.5),
             ]
             if normalization:
                 layers.append(nn.BatchNorm2d(out_channels))
-            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            # layers.append(nn.LeakyReLU(0.2, inplace=True))
             return layers
 
         self.embedding = nn.Sequential(
